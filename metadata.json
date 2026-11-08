@@ -1,0 +1,7 @@
+{
+  "name": "eHUB - Abuja's Cheapest Data & Bill Payment",
+  "description": "eHUB is Abuja's cheapest VTU and bills platform for instant data bundles, discounted airtime, AEDC electricity tokens, and TV subscriptions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+

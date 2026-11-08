@@ -1,0 +1,105 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Registered user profile and wallet balance",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "Firebase Auth UID or local user ID",
+          "maxLength": 128
+        },
+        "email": {
+          "type": "string",
+          "description": "User email address",
+          "maxLength": 256
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Full name of the user",
+          "maxLength": 100
+        },
+        "balance": {
+          "type": "number",
+          "description": "Wallet balance in Naira (NGN)"
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp ISO string",
+          "maxLength": 64
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last updated timestamp ISO string",
+          "maxLength": 64
+        }
+      },
+      "required": ["userId", "email", "balance"]
+    },
+    "Transaction": {
+      "title": "Transaction",
+      "description": "VTU purchase or wallet funding transaction record",
+      "type": "object",
+      "properties": {
+        "transactionId": {
+          "type": "string",
+          "description": "Unique transaction ID",
+          "maxLength": 128
+        },
+        "userId": {
+          "type": "string",
+          "description": "Owner user UID",
+          "maxLength": 128
+        },
+        "type": {
+          "type": "string",
+          "description": "Service type: data, airtime, electricity, cable, funding",
+          "enum": ["data", "airtime", "electricity", "cable", "funding"],
+          "maxLength": 32
+        },
+        "title": {
+          "type": "string",
+          "description": "Summary title of the transaction",
+          "maxLength": 128
+        },
+        "amount": {
+          "type": "number",
+          "description": "Transaction amount in Naira"
+        },
+        "status": {
+          "type": "string",
+          "description": "Status of transaction: successful, pending, failed",
+          "enum": ["successful", "pending", "failed"],
+          "maxLength": 32
+        },
+        "reference": {
+          "type": "string",
+          "description": "Paystack or ClubKonnect reference code",
+          "maxLength": 128
+        },
+        "details": {
+          "type": "string",
+          "description": "Detailed payload or token info (e.g. meter token, network, plan)",
+          "maxLength": 500
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Timestamp string",
+          "maxLength": 64
+        }
+      },
+      "required": ["transactionId", "userId", "type", "amount", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Stores individual user account and wallet data"
+    },
+    "/users/{userId}/transactions/{transactionId}": {
+      "schema": "Transaction",
+      "description": "User specific transaction history records"
+    }
+  }
+}
