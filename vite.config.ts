@@ -12,6 +12,14 @@ export default defineConfig(() => {
       },
     },
     server: {
+      proxy: {
+        '/api/clubkonnect': {
+          target: 'https://www.nellobytesystems.com',
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/api\/clubkonnect/, ''),
+          secure: false,
+        },
+      },
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',

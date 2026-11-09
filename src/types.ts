@@ -1,9 +1,23 @@
+export interface ReferredUserItem {
+  email: string;
+  displayName: string;
+  date: string;
+  bonus: number;
+}
+
 export interface EhubUser {
   userId: string;
   email: string;
   displayName: string;
   password?: string; // only in local auth
   balance: number;
+  referralCode?: string;
+  referredBy?: string;
+  referralEarnings?: number;
+  referralCount?: number;
+  referredUsers?: ReferredUserItem[];
+  biometricEnabled?: boolean;
+  biometricCredentialId?: string;
   createdAt: string;
   updatedAt?: string;
 }
@@ -41,4 +55,32 @@ export interface CablePackage {
   name: string;
   price: number;
   code: string;
+}
+
+export type NotificationType = 'transaction_success' | 'low_balance' | 'wallet_funded' | 'system';
+
+export interface PushNotificationItem {
+  id: string;
+  userId: string;
+  type: NotificationType;
+  title: string;
+  body: string;
+  timestamp: string;
+  read: boolean;
+  metadata?: {
+    transactionId?: string;
+    amount?: number;
+    currentBalance?: number;
+    threshold?: number;
+    token?: string;
+  };
+}
+
+export interface NotificationSettings {
+  pushEnabled: boolean;
+  transactionSuccessAlerts: boolean;
+  lowBalanceAlerts: boolean;
+  lowBalanceThreshold: number; // e.g., 500 = ₦500.00
+  soundEnabled: boolean;
+  vibrateEnabled: boolean;
 }

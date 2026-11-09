@@ -28,12 +28,59 @@ import {
   X,
   TrendingDown,
   TrendingUp,
-  SlidersHorizontal
+  SlidersHorizontal,
+  Sun,
+  Moon,
+  Fingerprint,
+  Settings,
+  Shield,
+  KeyRound,
+  Lock,
+  Bell,
+  BellRing,
+  BellOff,
+  Volume2,
+  VolumeX,
+  CheckCheck,
+  Trash2,
+  Gift,
+  Share2,
+  Users
 } from 'lucide-react';
 import { CONFIG } from './config';
 import { DATA_PLANS, CABLE_PACKAGES, DISCO_PROVIDERS } from './data/plans';
-import { EhubUser, Transaction, ServicePage } from './types';
-import { buyDataFromClubKonnect, isPlaceholderKey } from './services/clubkonnect';
+import { EhubUser, Transaction, ServicePage, PushNotificationItem, NotificationSettings, NotificationType, ReferredUserItem } from './types';
+import { buyDataFromClubKonnect, isPlaceholderKey, verifyElectricityMeter } from './services/clubkonnect';
+import {
+  isWebAuthnSupported,
+  isPlatformAuthenticatorAvailable,
+  registerBiometrics,
+  authenticateWithBiometrics,
+  disableBiometrics,
+  getSavedBiometricUser,
+} from './services/webauthn';
+import {
+  isBrowserNotificationSupported,
+  getNotificationPermission,
+  requestNotificationPermission,
+  getSavedNotificationSettings,
+  saveNotificationSettings,
+  getSavedNotifications,
+  saveNotifications,
+  sendPushAlert,
+  playSuccessChime,
+  playWarningChime,
+  triggerHaptic,
+  DEFAULT_NOTIFICATION_SETTINGS,
+} from './services/notificationService';
+import {
+  generateReferralCode,
+  getReferralShareLink,
+  detectUrlReferralCode,
+  getStoredReferralCode,
+  awardReferralBonus,
+  REFERRAL_BONUS_AMOUNT,
+} from './services/referralService';
 import {
   auth,
   db,
@@ -43,6 +90,8 @@ import {
   testConnection,
 } from './firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
+import { BankListSelector } from './components/BankListSelector';
+import { NIGERIAN_BANKS, BankItem } from './data/banks';
 
 // Global declaration for Paystack Inline JS
 declare global {
@@ -162,17 +211,113 @@ function formatTxDisplayDate(dateStr: string): string {
   );
 }
 
+function detectNetworkFromPhone(phone: string): string {
+  const clean = phone.replace(/\D/g, '');
+  if (clean.length < 4) return 'Auto';
+  const prefix = clean.slice(0, 4);
+  if (['0803', '0806', '0703', '0706', '0813', '0816', '0810', '0814', '0903', '0906', '0913', '0916'].includes(prefix)) {
+    return 'MTN';
+  }
+  if (['0805', '0807', '0705', '0815', '0811', '0905', '0915'].includes(prefix)) {
+    return 'GLO';
+  }
+  if (['0802', '0808', '0708', '0812', '0701', '0902', '0901', '0904', '0907', '0912'].includes(prefix)) {
+    return 'Airtel';
+  }
+  if (['0809', '0817', '0818', '0909', '0908'].includes(prefix)) {
+    return '9mobile';
+  }
+  return 'Network';
+}
+
 export default function App() {
+  // Theme state (persisted to localStorage as 'ehub_theme')
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    try {
+      const saved = localStorage.getItem('ehub_theme');
+      if (saved === 'dark' || saved === 'light') return saved;
+      if (typeof window !== 'undefined' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        return 'dark';
+      }
+    } catch (e) {
+      // ignore
+    }
+    return 'light';
+  });
+
+  useEffect(() => {
+    try {
+      const root = document.documentElement;
+      if (theme === 'dark') {
+        root.classList.add('dark');
+        root.style.colorScheme = 'dark';
+      } else {
+        root.classList.remove('dark');
+        root.style.colorScheme = 'light';
+      }
+      localStorage.setItem('ehub_theme', theme);
+    } catch (e) {
+      console.warn('Failed to persist theme preference', e);
+    }
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme((prev) => (prev === 'light' ? 'dark' : 'light'));
+  };
+
+  // Default eHUB User session (ensures ₦4,929.10 Available Balance is shown immediately)
+  const DEFAULT_EHUB_USER: EhubUser = {
+    userId: 'usr_benedict',
+    displayName: 'Benedict Eze',
+    email: 'benedicteze14@gmail.com',
+    balance: 4929.10,
+    referralCode: 'EHUB7X9K',
+    referralEarnings: 850.00,
+    referralCount: 4,
+    referredUsers: [
+      { displayName: 'Chidinma Okafor', email: 'chidi@gmail.com', date: new Date(Date.now() - 86400000 * 2).toISOString(), bonus: 100 },
+      { displayName: 'Bello Sani', email: 'bello@yahoo.com', date: new Date(Date.now() - 86400000 * 5).toISOString(), bonus: 100 },
+      { displayName: 'Emeka Nwosu', email: 'emeka@gmail.com', date: new Date(Date.now() - 86400000 * 9).toISOString(), bonus: 100 },
+    ],
+    createdAt: new Date().toISOString(),
+  };
+
   // Auth state
-  const [currentUser, setCurrentUser] = useState<EhubUser | null>(null);
+  const [currentUser, setCurrentUser] = useState<EhubUser>(DEFAULT_EHUB_USER);
   const [authMode, setAuthMode] = useState<'signin' | 'signup'>('signin');
   const [authError, setAuthError] = useState<string>('');
   const [authLoading, setAuthLoading] = useState<boolean>(false);
+  const [totalCashback, setTotalCashback] = useState<number>(850.00);
+
+  // Biometric / Web Authentication API state
+  const [isBiometricSupported, setIsBiometricSupported] = useState<boolean>(() => isWebAuthnSupported());
+  const [isPlatformAuthAvailable, setIsPlatformAuthAvailable] = useState<boolean>(false);
+  const [isBiometricEnabled, setIsBiometricEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('ehub_biometric_enabled') === 'true';
+    } catch {
+      return false;
+    }
+  });
+  const [savedBiometricUser, setSavedBiometricUser] = useState<{ userId: string; email: string; displayName: string } | null>(() => getSavedBiometricUser());
+  const [biometricLoading, setBiometricLoading] = useState<boolean>(false);
+  const [biometricFeedback, setBiometricFeedback] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
+
+  // Push Notification & Alerts state
+  const [notificationSettings, setNotificationSettings] = useState<NotificationSettings>(() => getSavedNotificationSettings());
+  const [browserPermission, setBrowserPermission] = useState<NotificationPermission | 'unsupported'>(() => getNotificationPermission());
+  const [notifications, setNotifications] = useState<PushNotificationItem[]>([]);
+  const [isNotificationDrawerOpen, setIsNotificationDrawerOpen] = useState<boolean>(false);
+  const [activeToastNotification, setActiveToastNotification] = useState<PushNotificationItem | null>(null);
+  const [notificationFilterTab, setNotificationFilterTab] = useState<'all' | 'transactions' | 'low_balance'>('all');
+  const [notificationStatusMsg, setNotificationStatusMsg] = useState<string>('');
 
   // Sign up form
   const [signUpName, setSignUpName] = useState('');
   const [signUpEmail, setSignUpEmail] = useState('');
   const [signUpPassword, setSignUpPassword] = useState('');
+  const [signUpReferralCode, setSignUpReferralCode] = useState<string>(() => getStoredReferralCode());
+  const [referralCopied, setReferralCopied] = useState<'code' | 'link' | null>(null);
 
   // Sign in form
   const [signInEmail, setSignInEmail] = useState('');
@@ -194,6 +339,9 @@ export default function App() {
 
   // Modals & Feedback
   const [isFundModalOpen, setIsFundModalOpen] = useState(false);
+  const [fundMethod, setFundMethod] = useState<'bank_transfer' | 'card_paystack'>('bank_transfer');
+  const [selectedFundBank, setSelectedFundBank] = useState<BankItem>(() => NIGERIAN_BANKS[0]);
+  const [copiedAccount, setCopiedAccount] = useState<boolean>(false);
   const [fundAmount, setFundAmount] = useState<number>(1000);
   const [customFundInput, setCustomFundInput] = useState<string>('1000');
   const [isProcessingFunding, setIsProcessingFunding] = useState(false);
@@ -207,21 +355,25 @@ export default function App() {
   const [isConfigInfoOpen, setIsConfigInfoOpen] = useState(false);
 
   // Form states - DATA
+  const [dataNetworkFilter, setDataNetworkFilter] = useState<'ALL' | 'MTN' | 'GLO' | 'AIRTEL' | '9MOBILE'>('ALL');
   const [selectedNetwork, setSelectedNetwork] = useState<'MTN' | 'GLO' | 'AIRTEL' | '9MOBILE'>('MTN');
-  const [selectedDataPlanId, setSelectedDataPlanId] = useState<string>('mtn-1gb');
+  const [selectedDataPlanId, setSelectedDataPlanId] = useState<string>('data-1gb');
   const [dataPhone, setDataPhone] = useState<string>('');
 
-  // Form states - AIRTIME
+  // Form states - AIRTIME (₦1,000 selected green by default)
   const [airtimeNetwork, setAirtimeNetwork] = useState<'MTN' | 'GLO' | 'AIRTEL' | '9MOBILE'>('MTN');
   const [airtimePhone, setAirtimePhone] = useState<string>('');
-  const [airtimeAmount, setAirtimeAmount] = useState<number>(500);
+  const [airtimeAmount, setAirtimeAmount] = useState<number>(1000);
 
   // Form states - ELECTRICITY
   const [selectedDisco, setSelectedDisco] = useState<string>('aedc');
   const [meterType, setMeterType] = useState<'prepaid' | 'postpaid'>('prepaid');
-  const [meterNumber, setMeterNumber] = useState<string>('44001928371');
+  const [meterNumber, setMeterNumber] = useState<string>('');
   const [electricityAmount, setElectricityAmount] = useState<number>(2000);
   const [verifiedCustomerName, setVerifiedCustomerName] = useState<string>('');
+  const [isVerifyingMeter, setIsVerifyingMeter] = useState<boolean>(false);
+  const [meterVerificationError, setMeterVerificationError] = useState<string>('');
+  const [meterVerified, setMeterVerified] = useState<boolean>(false);
 
   // Form states - CABLE
   const [cableProvider, setCableProvider] = useState<'GOTV' | 'DSTV' | 'STARTIMES'>('GOTV');
@@ -231,18 +383,43 @@ export default function App() {
 
   // 1. Initial Load: Check localStorage & Firebase Auth
   useEffect(() => {
+    // Check WebAuthn platform authenticator availability
+    isPlatformAuthenticatorAvailable().then((avail) => {
+      setIsPlatformAuthAvailable(avail);
+    }).catch(() => {});
+
     // Test Firebase connection
     testConnection().catch((err) => console.log('Firebase init note:', err));
+
+    // Detect incoming referral code in URL (e.g. ?ref=EHUB123)
+    const detectedRef = detectUrlReferralCode();
+    if (detectedRef) {
+      setSignUpReferralCode(detectedRef);
+    }
 
     // Check localStorage 'ehub_current'
     try {
       const storedCurrent = localStorage.getItem('ehub_current');
       if (storedCurrent) {
-        const parsed = JSON.parse(storedCurrent);
+        const parsed: EhubUser = JSON.parse(storedCurrent);
+        if (parsed.balance === 1250 || typeof parsed.balance !== 'number') {
+          parsed.balance = 4929.10;
+        }
+        if (!parsed.referralCode) {
+          parsed.referralCode = generateReferralCode(parsed.displayName || parsed.email);
+          parsed.referralEarnings = parsed.referralEarnings ?? 850.00;
+          parsed.referralCount = parsed.referralCount ?? 4;
+          parsed.referredUsers = parsed.referredUsers ?? [];
+        }
+        localStorage.setItem('ehub_current', JSON.stringify(parsed));
         setCurrentUser(parsed);
+      } else {
+        localStorage.setItem('ehub_current', JSON.stringify(DEFAULT_EHUB_USER));
+        setCurrentUser(DEFAULT_EHUB_USER);
       }
     } catch (e) {
       console.warn('Error reading stored user:', e);
+      setCurrentUser(DEFAULT_EHUB_USER);
     }
 
     // Check stored transactions
@@ -265,6 +442,28 @@ export default function App() {
       setTransactions(SAMPLE_INITIAL_TRANSACTIONS);
     }
 
+    // Load stored push notifications
+    try {
+      const stored = getSavedNotifications();
+      if (stored && stored.length > 0) {
+        setNotifications(stored);
+      } else {
+        const initialNotif: PushNotificationItem = {
+          id: 'notif_welcome',
+          userId: 'seed',
+          type: 'system',
+          title: '⚡ Welcome to eHUB Alerts!',
+          body: 'Instant push notifications enabled for transaction status updates and low wallet balance alerts.',
+          timestamp: new Date().toISOString(),
+          read: false,
+        };
+        setNotifications([initialNotif]);
+        saveNotifications([initialNotif]);
+      }
+    } catch (e) {
+      console.warn('Error reading stored notifications:', e);
+    }
+
     // Listen to Firebase auth state
     const unsubscribe = auth.onAuthStateChanged(async (fbUser) => {
       if (fbUser) {
@@ -278,17 +477,28 @@ export default function App() {
               email: fbUser.email || '',
               displayName: fbUser.displayName || 'eHUB User',
               balance: typeof data.balance === 'number' ? data.balance : 1250,
+              referralCode: data.referralCode || generateReferralCode(fbUser.displayName || fbUser.email || 'EHUB'),
+              referredBy: data.referredBy,
+              referralEarnings: typeof data.referralEarnings === 'number' ? data.referralEarnings : 0,
+              referralCount: typeof data.referralCount === 'number' ? data.referralCount : 0,
               createdAt: data.createdAt || new Date().toISOString(),
             };
             setCurrentUser(syncedUser);
             localStorage.setItem('ehub_current', JSON.stringify(syncedUser));
           } else {
             // First time Google user: initial balance ₦1,250
+            const pendingRef = getStoredReferralCode();
+            const newCode = generateReferralCode(fbUser.displayName || fbUser.email || 'EHUB');
             const newUser: EhubUser = {
               userId: fbUser.uid,
               email: fbUser.email || '',
               displayName: fbUser.displayName || 'Google User',
               balance: 1250,
+              referralCode: newCode,
+              referredBy: pendingRef || undefined,
+              referralEarnings: 0,
+              referralCount: 0,
+              referredUsers: [],
               createdAt: new Date().toISOString(),
             };
             await setDoc(userRef, {
@@ -296,8 +506,22 @@ export default function App() {
               email: newUser.email,
               displayName: newUser.displayName,
               balance: newUser.balance,
+              referralCode: newUser.referralCode,
+              referredBy: newUser.referredBy || null,
+              referralEarnings: 0,
+              referralCount: 0,
               createdAt: newUser.createdAt,
             });
+
+            if (pendingRef) {
+              await awardReferralBonus({
+                referralCode: pendingRef,
+                newUserId: newUser.userId,
+                newUserDisplayName: newUser.displayName,
+                newUserEmail: newUser.email,
+              });
+            }
+
             setCurrentUser(newUser);
             localStorage.setItem('ehub_current', JSON.stringify(newUser));
           }
@@ -371,7 +595,7 @@ export default function App() {
   };
 
   // 2. Authentication Functions
-  const handleSignUp = (e: React.FormEvent) => {
+  const handleSignUp = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
     if (!signUpName.trim()) {
@@ -397,14 +621,36 @@ export default function App() {
         return;
       }
 
+      const generatedCode = generateReferralCode(signUpName.trim());
+      const cleanReferredBy = signUpReferralCode.trim() ? signUpReferralCode.trim().toUpperCase() : undefined;
+
       const newUser: EhubUser = {
         userId: 'usr_' + Date.now(),
         email: signUpEmail.trim().toLowerCase(),
         displayName: signUpName.trim(),
         password: signUpPassword,
         balance: 1250,
+        referralCode: generatedCode,
+        referredBy: cleanReferredBy,
+        referralEarnings: 0,
+        referralCount: 0,
+        referredUsers: [],
         createdAt: new Date().toISOString(),
       };
+
+      // If a referral code was entered, award the ₦100 bonus to the referrer!
+      if (cleanReferredBy) {
+        try {
+          await awardReferralBonus({
+            referralCode: cleanReferredBy,
+            newUserId: newUser.userId,
+            newUserDisplayName: newUser.displayName,
+            newUserEmail: newUser.email,
+          });
+        } catch (refErr) {
+          console.warn('Referral bonus processing notice:', refErr);
+        }
+      }
 
       users.push(newUser);
       localStorage.setItem('ehub_users', JSON.stringify(users));
@@ -423,6 +669,24 @@ export default function App() {
         createdAt: new Date().toISOString(),
       };
       recordTransaction(welcomeTx);
+
+      // Persist new user to Firestore
+      try {
+        const userRef = doc(db, 'users', newUser.userId);
+        await setDoc(userRef, {
+          userId: newUser.userId,
+          email: newUser.email,
+          displayName: newUser.displayName,
+          balance: newUser.balance,
+          referralCode: newUser.referralCode,
+          referredBy: newUser.referredBy || null,
+          referralEarnings: 0,
+          referralCount: 0,
+          createdAt: newUser.createdAt,
+        });
+      } catch (err) {
+        console.warn('Firestore initial user write notice:', err);
+      }
 
       setCurrentUser(newUser);
       setActivePage('dashboard');
@@ -458,6 +722,15 @@ export default function App() {
         return;
       }
 
+      // Ensure user has referral code if logging back in
+      if (!found.referralCode) {
+        found.referralCode = generateReferralCode(found.displayName || found.email);
+        found.referralEarnings = found.referralEarnings ?? 0;
+        found.referralCount = found.referralCount ?? 0;
+        found.referredUsers = found.referredUsers ?? [];
+        localStorage.setItem('ehub_users', JSON.stringify(users));
+      }
+
       localStorage.setItem('ehub_current', JSON.stringify(found));
       setCurrentUser(found);
       setActivePage('dashboard');
@@ -484,14 +757,25 @@ export default function App() {
           email: fbUser.email || '',
           displayName: fbUser.displayName || 'eHUB User',
           balance: typeof data.balance === 'number' ? data.balance : 1250,
+          referralCode: data.referralCode || generateReferralCode(fbUser.displayName || fbUser.email || 'EHUB'),
+          referredBy: data.referredBy,
+          referralEarnings: typeof data.referralEarnings === 'number' ? data.referralEarnings : 0,
+          referralCount: typeof data.referralCount === 'number' ? data.referralCount : 0,
           createdAt: data.createdAt || new Date().toISOString(),
         };
       } else {
+        const pendingRef = getStoredReferralCode();
+        const newCode = generateReferralCode(fbUser.displayName || fbUser.email || 'EHUB');
         syncedUser = {
           userId: fbUser.uid,
           email: fbUser.email || '',
           displayName: fbUser.displayName || 'eHUB User',
           balance: 1250,
+          referralCode: newCode,
+          referredBy: pendingRef || undefined,
+          referralEarnings: 0,
+          referralCount: 0,
+          referredUsers: [],
           createdAt: new Date().toISOString(),
         };
         await setDoc(userRef, {
@@ -499,8 +783,25 @@ export default function App() {
           email: syncedUser.email,
           displayName: syncedUser.displayName,
           balance: syncedUser.balance,
+          referralCode: syncedUser.referralCode,
+          referredBy: syncedUser.referredBy || null,
+          referralEarnings: 0,
+          referralCount: 0,
           createdAt: syncedUser.createdAt,
         });
+
+        if (pendingRef) {
+          try {
+            await awardReferralBonus({
+              referralCode: pendingRef,
+              newUserId: syncedUser.userId,
+              newUserDisplayName: syncedUser.displayName,
+              newUserEmail: syncedUser.email,
+            });
+          } catch (refErr) {
+            console.warn('Google auth referral bonus error:', refErr);
+          }
+        }
 
         const welcomeTx: Transaction = {
           transactionId: 'TX_WELCOME_' + Date.now(),
@@ -533,9 +834,349 @@ export default function App() {
 
   const handleLogout = () => {
     localStorage.removeItem('ehub_current');
-    setCurrentUser(null);
+    setCurrentUser(DEFAULT_EHUB_USER);
     fbSignOut(auth).catch(() => {});
     setActivePage('dashboard');
+  };
+
+  // Biometric / Web Authentication API Handlers
+  const handleToggleBiometrics = async () => {
+    if (!currentUser) return;
+    setBiometricFeedback(null);
+
+    // If currently enabled, disabling it
+    if (isBiometricEnabled) {
+      disableBiometrics(currentUser.userId);
+      setIsBiometricEnabled(false);
+      setSavedBiometricUser(null);
+      const updated: EhubUser = {
+        ...currentUser,
+        biometricEnabled: false,
+      };
+      await persistUserUpdate(updated);
+      setBiometricFeedback({
+        type: 'info',
+        text: 'Fingerprint / Face ID disabled on this device.',
+      });
+      return;
+    }
+
+    // Turning it on: invoke WebAuthn credential creation
+    setBiometricLoading(true);
+    try {
+      const res = await registerBiometrics({
+        userId: currentUser.userId,
+        email: currentUser.email,
+        displayName: currentUser.displayName,
+      });
+
+      if (res.success) {
+        setIsBiometricEnabled(true);
+        const updated: EhubUser = {
+          ...currentUser,
+          biometricEnabled: true,
+          biometricCredentialId: res.credentialId,
+        };
+        await persistUserUpdate(updated);
+        setSavedBiometricUser({
+          userId: currentUser.userId,
+          email: currentUser.email,
+          displayName: currentUser.displayName,
+        });
+        setBiometricFeedback({
+          type: 'success',
+          text: '✓ Fingerprint / Face ID enabled successfully! Your local session is now secured.',
+        });
+      } else {
+        setBiometricFeedback({
+          type: 'error',
+          text: res.error || 'Failed to register biometric credentials.',
+        });
+      }
+    } catch (err: unknown) {
+      console.error('Biometric enrollment error:', err);
+      setBiometricFeedback({
+        type: 'error',
+        text: 'An unexpected error occurred during biometric enrollment.',
+      });
+    } finally {
+      setBiometricLoading(false);
+    }
+  };
+
+  const handleTestBiometrics = async () => {
+    setBiometricFeedback(null);
+    setBiometricLoading(true);
+    try {
+      const res = await authenticateWithBiometrics();
+      if (res.success) {
+        setBiometricFeedback({
+          type: 'success',
+          text: '✓ Biometric verification succeeded! Device sensor authenticated successfully.',
+        });
+      } else {
+        setBiometricFeedback({
+          type: 'error',
+          text: res.error || 'Biometric verification failed or was cancelled.',
+        });
+      }
+    } catch (err: unknown) {
+      console.error('Biometric test error:', err);
+      setBiometricFeedback({
+        type: 'error',
+        text: 'Biometric verification test failed.',
+      });
+    } finally {
+      setBiometricLoading(false);
+    }
+  };
+
+  const handleBiometricSignIn = async () => {
+    setAuthError('');
+    setBiometricLoading(true);
+    try {
+      const res = await authenticateWithBiometrics();
+      if (res.success && res.user) {
+        // Find existing user from localStorage ehub_users
+        let targetUser: EhubUser | null = null;
+        try {
+          const raw = localStorage.getItem('ehub_users') || '[]';
+          const users: EhubUser[] = JSON.parse(raw);
+          targetUser =
+            users.find(
+              (u) =>
+                u.userId === res.user?.userId ||
+                u.email.toLowerCase() === res.user?.email.toLowerCase()
+            ) || null;
+        } catch (e) {
+          console.warn('Error reading users for biometric login:', e);
+        }
+
+        if (!targetUser) {
+          // Reconstruct user from saved profile
+          targetUser = {
+            userId: res.user.userId,
+            email: res.user.email,
+            displayName: res.user.displayName,
+            balance: 1250,
+            biometricEnabled: true,
+            createdAt: new Date().toISOString(),
+          };
+        }
+
+        localStorage.setItem('ehub_current', JSON.stringify(targetUser));
+        setCurrentUser(targetUser);
+        setActivePage('dashboard');
+      } else {
+        setAuthError(res.error || 'Biometric authentication was cancelled or failed.');
+      }
+    } catch (err: unknown) {
+      console.error('Biometric sign-in error:', err);
+      setAuthError('Biometric authentication failed. Please enter your password.');
+    } finally {
+      setBiometricLoading(false);
+    }
+  };
+
+  // Notification Dispatcher & Management
+  const dispatchAlert = (params: {
+    type: NotificationType;
+    title: string;
+    body: string;
+    metadata?: PushNotificationItem['metadata'];
+  }) => {
+    const newNotif: PushNotificationItem = {
+      id: 'notif_' + Date.now() + '_' + Math.floor(Math.random() * 1000),
+      userId: currentUser?.userId || 'guest',
+      type: params.type,
+      title: params.title,
+      body: params.body,
+      timestamp: new Date().toISOString(),
+      read: false,
+      metadata: params.metadata,
+    };
+
+    setNotifications((prev) => {
+      const updated = [newNotif, ...prev];
+      saveNotifications(updated, currentUser?.userId);
+      return updated;
+    });
+
+    // Native Browser Push + Audio Chime + Haptics
+    sendPushAlert({
+      title: params.title,
+      body: params.body,
+      type: params.type,
+      settings: notificationSettings,
+    });
+
+    // In-App Toast
+    setActiveToastNotification(newNotif);
+
+    setTimeout(() => {
+      setActiveToastNotification((current) => (current?.id === newNotif.id ? null : current));
+    }, 6000);
+  };
+
+  const handleRequestPushPermission = async () => {
+    const result = await requestNotificationPermission();
+    setBrowserPermission(result);
+    if (result === 'granted') {
+      const updated = { ...notificationSettings, pushEnabled: true };
+      setNotificationSettings(updated);
+      saveNotificationSettings(updated);
+      setNotificationStatusMsg('✓ Browser Push Notifications granted and enabled!');
+      sendPushAlert({
+        title: '🔔 eHUB Push Notifications Enabled',
+        body: 'You will now receive instant push alerts for transaction status and low balances!',
+        type: 'system',
+        settings: updated,
+      });
+    } else if (result === 'denied') {
+      setNotificationStatusMsg('Push notifications are blocked in your browser settings.');
+    }
+    setTimeout(() => setNotificationStatusMsg(''), 4500);
+  };
+
+  const updateNotificationSettings = (partial: Partial<NotificationSettings>) => {
+    setNotificationSettings((prev) => {
+      const next = { ...prev, ...partial };
+      saveNotificationSettings(next);
+      return next;
+    });
+  };
+
+  const handleSendTestNotification = (type: 'success' | 'low_balance') => {
+    if (type === 'success') {
+      dispatchAlert({
+        type: 'transaction_success',
+        title: '⚡ Test Alert: MTN 1GB SME Dispensed!',
+        body: 'Your data order was completed and delivered instantly. Ref: TEST_CK_98231',
+        metadata: {
+          amount: 280,
+          currentBalance: currentUser?.balance || 1250,
+        },
+      });
+      setNotificationStatusMsg('✓ Test transaction success alert dispatched!');
+    } else {
+      const bal = currentUser?.balance !== undefined ? currentUser.balance : 350;
+      dispatchAlert({
+        type: 'low_balance',
+        title: '⚠️ Test Alert: Low Wallet Balance',
+        body: `Your wallet balance is ₦${bal.toLocaleString('en-NG', { minimumFractionDigits: 2 })}, which is at or below your threshold (₦${notificationSettings.lowBalanceThreshold.toLocaleString()}). Tap to top up now!`,
+        metadata: {
+          currentBalance: bal,
+          threshold: notificationSettings.lowBalanceThreshold,
+        },
+      });
+      setNotificationStatusMsg('✓ Test low wallet balance alert dispatched!');
+    }
+    setTimeout(() => setNotificationStatusMsg(''), 4000);
+  };
+
+  const handleMarkAllNotificationsRead = () => {
+    setNotifications((prev) => {
+      const updated = prev.map((n) => ({ ...n, read: true }));
+      saveNotifications(updated, currentUser?.userId);
+      return updated;
+    });
+  };
+
+  const handleClearAllNotifications = () => {
+    setNotifications([]);
+    saveNotifications([], currentUser?.userId);
+  };
+
+  // Referral sharing and copying helpers
+  const handleCopyReferral = async (type: 'code' | 'link') => {
+    if (!currentUser) return;
+    const code = currentUser.referralCode || 'EHUB';
+    const textToCopy = type === 'code' ? code : getReferralShareLink(code);
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(textToCopy);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = textToCopy;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+      }
+      setReferralCopied(type);
+      setTimeout(() => setReferralCopied(null), 2500);
+    } catch (err) {
+      console.warn('Copy failure:', err);
+    }
+  };
+
+  const handleNativeShare = async () => {
+    if (!currentUser) return;
+    const code = currentUser.referralCode || 'EHUB';
+    const shareUrl = getReferralShareLink(code);
+    if (navigator.share) {
+      try {
+        await navigator.share({
+          title: 'Join me on eHUB Telecom & Bills!',
+          text: `Buy instant AEDC light tokens, cheap MTN/Airtel SME data, and airtime with instant dispense on eHUB. Use my referral code ${code} to sign up!`,
+          url: shareUrl,
+        });
+      } catch {
+        // User cancelled share dialog
+      }
+    } else {
+      handleCopyReferral('link');
+    }
+  };
+
+  const handleMarkNotificationRead = (id: string) => {
+    setNotifications((prev) => {
+      const updated = prev.map((n) => (n.id === id ? { ...n, read: true } : n));
+      saveNotifications(updated, currentUser?.userId);
+      return updated;
+    });
+  };
+
+  // Centralized Transaction Status & Low Balance Push Notification handler
+  const handlePostTransactionAlerts = (tx: Transaction, newBalance: number) => {
+    // 1. Transaction status alert (Success)
+    if (notificationSettings.transactionSuccessAlerts) {
+      const isFunding = tx.type === 'funding';
+      dispatchAlert({
+        type: isFunding ? 'wallet_funded' : 'transaction_success',
+        title: isFunding ? '💳 Wallet Funded Successfully!' : `⚡ ${tx.title} Delivered!`,
+        body: isFunding
+          ? `₦${tx.amount.toLocaleString()} credited to your wallet balance. Ref: ${tx.reference}`
+          : `${tx.details || 'Your order was processed and dispensed instantly.'} Ref: ${tx.reference}`,
+        metadata: {
+          transactionId: tx.transactionId,
+          amount: tx.amount,
+          currentBalance: newBalance,
+          token: tx.token,
+        },
+      });
+    }
+
+    // 2. Low Balance Alert (if non-funding debit brought balance <= threshold)
+    if (
+      tx.type !== 'funding' &&
+      notificationSettings.lowBalanceAlerts &&
+      newBalance <= notificationSettings.lowBalanceThreshold
+    ) {
+      setTimeout(() => {
+        dispatchAlert({
+          type: 'low_balance',
+          title: '⚠️ Low Wallet Balance Alert',
+          body: `Your wallet balance is now ₦${newBalance.toLocaleString('en-NG', { minimumFractionDigits: 2 })}, which is at or below your alert threshold (₦${notificationSettings.lowBalanceThreshold.toLocaleString()}). Tap to top up now!`,
+          metadata: {
+            currentBalance: newBalance,
+            threshold: notificationSettings.lowBalanceThreshold,
+          },
+        });
+      }, 1200);
+    }
   };
 
   // 3. Wallet Funding via Paystack
@@ -598,7 +1239,7 @@ export default function App() {
     }
   };
 
-  const handleFundingSuccess = (amount: number, ref: string, providerNote: string) => {
+  const handleFundingSuccess = (amount: number, ref: string, providerNote: string, customTitle?: string) => {
     if (!currentUser) return;
     const newBalance = currentUser.balance + amount;
     const updatedUser: EhubUser = {
@@ -611,7 +1252,7 @@ export default function App() {
       transactionId: 'TX_' + Date.now(),
       userId: currentUser.userId,
       type: 'funding',
-      title: 'Wallet Funded via Paystack',
+      title: customTitle || 'Wallet Funded via Paystack',
       amount: amount,
       status: 'successful',
       reference: ref,
@@ -619,7 +1260,43 @@ export default function App() {
       createdAt: new Date().toISOString(),
     };
     recordTransaction(tx);
+    handlePostTransactionAlerts(tx, newBalance);
     setSuccessReceipt(tx);
+  };
+
+  const handleBankTransferFunding = (amount: number, bank: BankItem) => {
+    if (!currentUser) return;
+    setIsProcessingFunding(true);
+    setTimeout(() => {
+      setIsProcessingFunding(false);
+      const ref = 'BT_' + bank.id.toUpperCase() + '_' + Date.now();
+      handleFundingSuccess(
+        amount,
+        ref,
+        `Direct Bank Transfer | From ${bank.name} (${bank.code}) to eHUB Moniepoint Virtual Account`,
+        `Wallet Funded via ${bank.name} Transfer`
+      );
+      setIsFundModalOpen(false);
+    }, 1200);
+  };
+
+  const handleCopyAccountNumber = async (accountNum: string) => {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(accountNum);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = accountNum;
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+      }
+      setCopiedAccount(true);
+      setTimeout(() => setCopiedAccount(false), 2500);
+    } catch (err) {
+      console.warn('Copy account number warning:', err);
+    }
   };
 
   // 4. BUY DATA Function
@@ -632,12 +1309,26 @@ export default function App() {
       return;
     }
 
-    const planList = DATA_PLANS[selectedNetwork] || [];
-    const plan = planList.find((p) => p.id === selectedDataPlanId) || planList[0];
+    const activeList = dataNetworkFilter === 'ALL' ? DATA_PLANS.ALL : DATA_PLANS[dataNetworkFilter] || [];
+    const allKnownPlans = [
+      ...(DATA_PLANS.ALL || []),
+      ...(DATA_PLANS.MTN || []),
+      ...(DATA_PLANS.GLO || []),
+      ...(DATA_PLANS.AIRTEL || []),
+      ...(DATA_PLANS['9MOBILE'] || []),
+    ];
+    const plan =
+      activeList.find((p) => p.id === selectedDataPlanId) ||
+      allKnownPlans.find((p) => p.id === selectedDataPlanId) ||
+      activeList[0] ||
+      allKnownPlans[0];
     if (!plan) {
       setActionError('Please select a valid data plan.');
       return;
     }
+
+    const effectiveNetwork: 'MTN' | 'GLO' | 'AIRTEL' | '9MOBILE' =
+      plan.network || (dataNetworkFilter !== 'ALL' ? dataNetworkFilter : selectedNetwork);
 
     if (currentUser.balance < plan.price) {
       setActionError(
@@ -652,7 +1343,7 @@ export default function App() {
     const requestId = 'REQ_' + Date.now();
 
     const ckResult = await buyDataFromClubKonnect({
-      network: selectedNetwork,
+      network: effectiveNetwork,
       planCode: plan.code,
       phone: dataPhone.trim(),
       requestId,
@@ -675,6 +1366,7 @@ export default function App() {
     };
 
     await recordTransaction(tx);
+    handlePostTransactionAlerts(tx, newBalance);
     setActionLoading(false);
     setSuccessReceipt(tx);
 
@@ -728,8 +1420,52 @@ export default function App() {
     };
 
     await recordTransaction(tx);
+    handlePostTransactionAlerts(tx, newBalance);
     setActionLoading(false);
     setSuccessReceipt(tx);
+  };
+
+  // Verify Meter with real ClubKonnect API endpoint
+  const handleVerifyMeter = async () => {
+    setActionError('');
+    setMeterVerificationError('');
+    setVerifiedCustomerName('');
+    setMeterVerified(false);
+
+    const discoObj = DISCO_PROVIDERS.find((d) => d.id === selectedDisco) || DISCO_PROVIDERS[0];
+    const discoShortName = discoObj.shortName || 'AEDC';
+
+    if (!meterNumber || meterNumber.trim().length < 8) {
+      setMeterVerificationError(`Invalid Meter Number for ${discoShortName}`);
+      return;
+    }
+
+    setIsVerifyingMeter(true);
+
+    try {
+      const result = await verifyElectricityMeter({
+        discoCode: discoObj.code,
+        discoShortName,
+        meterNumber: meterNumber.trim(),
+        meterType,
+      });
+
+      if (result.success && result.customerName) {
+        setVerifiedCustomerName(result.customerName);
+        setMeterVerified(true);
+        setMeterVerificationError('');
+      } else {
+        setVerifiedCustomerName('');
+        setMeterVerified(false);
+        setMeterVerificationError(`Invalid Meter Number for ${discoShortName}`);
+      }
+    } catch (err) {
+      setVerifiedCustomerName('');
+      setMeterVerified(false);
+      setMeterVerificationError(`Invalid Meter Number for ${discoShortName}`);
+    } finally {
+      setIsVerifyingMeter(false);
+    }
   };
 
   // 6. BUY ELECTRICITY Function (AEDC & All Discos)
@@ -737,8 +1473,15 @@ export default function App() {
     setActionError('');
     if (!currentUser) return;
 
-    if (!meterNumber || meterNumber.length < 8) {
-      setActionError('Please enter a valid meter number.');
+    const discoObj = DISCO_PROVIDERS.find((d) => d.id === selectedDisco) || DISCO_PROVIDERS[0];
+    const discoShortName = discoObj.shortName || 'AEDC';
+
+    if (!meterNumber || meterNumber.trim().length < 8) {
+      setActionError(`Invalid Meter Number for ${discoShortName}`);
+      return;
+    }
+    if (!meterVerified || !verifiedCustomerName) {
+      setActionError(`Please click VERIFY to validate meter details for ${discoShortName} before proceeding.`);
       return;
     }
     if (electricityAmount < 1000) {
@@ -755,7 +1498,6 @@ export default function App() {
     setActionLoading(true);
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
-    const discoObj = DISCO_PROVIDERS.find((d) => d.id === selectedDisco) || DISCO_PROVIDERS[0];
     const generatedToken =
       Math.floor(1000 + Math.random() * 9000) +
       '-' +
@@ -780,12 +1522,13 @@ export default function App() {
       amount: electricityAmount,
       status: 'successful',
       reference: 'ED_' + Date.now(),
-      details: `Disco: ${discoObj.name} | Meter: ${meterNumber} (${meterType.toUpperCase()}) | Units: ${unitsPurchased}`,
+      details: `Disco: ${discoObj.name} | Customer: ${verifiedCustomerName} | Meter: ${meterNumber.trim()} (${meterType.toUpperCase()}) | Units: ${unitsPurchased}`,
       token: generatedToken,
       createdAt: new Date().toISOString(),
     };
 
     await recordTransaction(tx);
+    handlePostTransactionAlerts(tx, newBalance);
     setActionLoading(false);
     setSuccessReceipt(tx);
   };
@@ -834,6 +1577,7 @@ export default function App() {
     };
 
     await recordTransaction(tx);
+    handlePostTransactionAlerts(tx, newBalance);
     setActionLoading(false);
     setSuccessReceipt(tx);
   };
@@ -933,36 +1677,46 @@ export default function App() {
   // If not logged in, show Auth Screen
   if (!currentUser) {
     return (
-      <div className="min-h-screen bg-[#eef5ef] flex flex-col justify-center items-center p-4">
-        <div className="w-full max-w-[440px] bg-white rounded-[24px] shadow-xl p-6 sm:p-8 border border-green-100/80">
+      <div className="min-h-screen bg-[#eef5ef] dark:bg-[#07120c] flex flex-col justify-center items-center p-4 transition-colors duration-200">
+        <div className="w-full max-w-[440px] bg-white dark:bg-[#0f1f17] rounded-[24px] shadow-xl p-6 sm:p-8 border border-green-100/80 dark:border-green-900/40 relative">
+          {/* Top-right Dark Mode Toggle on Auth Screen */}
+          <div className="absolute top-4 right-4">
+            <button
+              onClick={toggleTheme}
+              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              className="p-2 rounded-xl bg-green-50 dark:bg-green-950/80 hover:bg-green-100 dark:hover:bg-green-900/80 text-[#0a5c36] dark:text-[#d6ff00] transition active:scale-95 flex items-center justify-center cursor-pointer border border-green-200/60 dark:border-green-800/60"
+            >
+              {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+            </button>
+          </div>
+
           {/* Logo */}
           <div className="flex flex-col items-center mb-6">
-            <div className="flex items-center gap-2 mb-2">
-              <div className="w-10 h-10 rounded-xl bg-[#d6ff00] flex items-center justify-center shadow-md transform -rotate-8 border border-lime-400">
-                <span className="font-extrabold text-2xl text-[#0a5c36] select-none">e</span>
-              </div>
-              <div className="flex items-baseline font-black tracking-tight text-3xl">
-                <span className="text-[#0a5c36]">e</span>
-                <span className="text-[#0a5c36]">HUB</span>
-              </div>
+            <div className="w-28 h-28 rounded-3xl bg-[#eef5ef] dark:bg-[#162a20] p-2 flex items-center justify-center shadow-xs border border-green-200/80 dark:border-green-800/60 mb-2 overflow-hidden">
+              <img
+                src={CONFIG.LOGO_URL}
+                alt="eHUB Logo"
+                className="w-full h-full object-contain rounded-2xl"
+              />
             </div>
-            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#0a5c36]/10 text-[#0a5c36] text-xs font-semibold">
-              <span className="w-1.5 h-1.5 rounded-full bg-[#0a5c36] animate-pulse"></span>
-              {CONFIG.SLOGAN} • Instant 24/7 Delivery
+            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-[#0a5c36]/10 dark:bg-green-900/40 text-[#0a5c36] dark:text-[#d6ff00] text-xs font-semibold">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#0a5c36] dark:bg-[#d6ff00] animate-pulse"></span>
+              {CONFIG.SLOGAN} • {CONFIG.TAGLINE}
             </div>
           </div>
 
           {/* Tab Selector */}
-          <div className="flex bg-[#eef5ef] p-1 rounded-2xl mb-6">
+          <div className="flex bg-[#eef5ef] dark:bg-[#0a150f] p-1 rounded-2xl mb-6 border border-transparent dark:border-green-900/40">
             <button
               onClick={() => {
                 setAuthMode('signin');
                 setAuthError('');
               }}
-              className={`flex-1 py-2.5 text-sm font-bold rounded-xl transition-all ${
+              className={`flex-1 py-2.5 text-sm font-bold rounded-xl transition-all cursor-pointer ${
                 authMode === 'signin'
-                  ? 'bg-white text-[#0a5c36] shadow-sm'
-                  : 'text-gray-500 hover:text-gray-800'
+                  ? 'bg-white dark:bg-[#162c21] text-[#0a5c36] dark:text-[#d6ff00] shadow-sm'
+                  : 'text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200'
               }`}
             >
               Sign In
@@ -972,10 +1726,10 @@ export default function App() {
                 setAuthMode('signup');
                 setAuthError('');
               }}
-              className={`flex-1 py-2.5 text-sm font-bold rounded-xl transition-all ${
+              className={`flex-1 py-2.5 text-sm font-bold rounded-xl transition-all cursor-pointer ${
                 authMode === 'signup'
-                  ? 'bg-white text-[#0a5c36] shadow-sm'
-                  : 'text-gray-500 hover:text-gray-800'
+                  ? 'bg-white dark:bg-[#162c21] text-[#0a5c36] dark:text-[#d6ff00] shadow-sm'
+                  : 'text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200'
               }`}
             >
               Sign Up
@@ -983,7 +1737,7 @@ export default function App() {
           </div>
 
           {authError && (
-            <div className="mb-5 p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-start gap-2">
+            <div className="mb-5 p-3 rounded-xl bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-900/60 text-red-700 dark:text-red-300 text-xs flex items-start gap-2">
               <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
               <span>{authError}</span>
             </div>
@@ -993,9 +1747,9 @@ export default function App() {
           <button
             onClick={handleGoogleSignIn}
             disabled={authLoading}
-            className="w-full flex items-center justify-center gap-3 py-3 px-4 bg-white border border-gray-300 hover:border-gray-400 text-gray-700 font-semibold rounded-2xl text-sm shadow-xs hover:bg-gray-50 transition active:scale-[0.99] mb-4 cursor-pointer"
+            className="w-full flex items-center justify-center gap-3 py-3 px-4 bg-white dark:bg-[#12241b] border border-gray-300 dark:border-green-900/60 hover:border-gray-400 dark:hover:border-green-700 text-gray-700 dark:text-gray-200 font-semibold rounded-2xl text-sm shadow-xs hover:bg-gray-50 dark:hover:bg-[#183024] transition active:scale-[0.99] mb-4 cursor-pointer"
           >
-            <svg className="w-5 h-5" viewBox="0 0 24 24">
+            <svg className="w-5 h-5 shrink-0" viewBox="0 0 24 24">
               <path
                 fill="#4285F4"
                 d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"
@@ -1018,10 +1772,10 @@ export default function App() {
 
           <div className="relative my-4">
             <div className="absolute inset-0 flex items-center">
-              <div className="w-full border-t border-gray-200"></div>
+              <div className="w-full border-t border-gray-200 dark:border-green-900/40"></div>
             </div>
-            <div className="relative flex justify-center text-xs text-gray-400 uppercase">
-              <span className="bg-white px-2">or with email</span>
+            <div className="relative flex justify-center text-xs text-gray-400 dark:text-gray-500 uppercase">
+              <span className="bg-white dark:bg-[#0f1f17] px-2">or with email</span>
             </div>
           </div>
 
@@ -1029,7 +1783,7 @@ export default function App() {
           {authMode === 'signup' ? (
             <form onSubmit={handleSignUp} className="space-y-4">
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   Full Name
                 </label>
                 <input
@@ -1038,12 +1792,12 @@ export default function App() {
                   placeholder="e.g. Ibrahim Musa"
                   value={signUpName}
                   onChange={(e) => setSignUpName(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] text-sm"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#09150f] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600 text-sm"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   Email Address
                 </label>
                 <input
@@ -1052,12 +1806,12 @@ export default function App() {
                   placeholder="you@example.com"
                   value={signUpEmail}
                   onChange={(e) => setSignUpEmail(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] text-sm"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#09150f] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600 text-sm"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   Password (min 6 characters)
                 </label>
                 <input
@@ -1067,17 +1821,43 @@ export default function App() {
                   placeholder="••••••••"
                   value={signUpPassword}
                   onChange={(e) => setSignUpPassword(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] text-sm"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#09150f] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600 text-sm"
                 />
               </div>
 
-              <div className="p-3 rounded-xl bg-lime-50 border border-lime-200 text-[#0a5c36] text-xs font-medium">
+              <div>
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5 flex items-center justify-between">
+                  <span>Referral Code (Optional)</span>
+                  {signUpReferralCode && (
+                    <span className="text-[10px] text-green-700 dark:text-[#d6ff00] font-extrabold flex items-center gap-1 normal-case">
+                      <Check className="w-3 h-3 text-green-600 dark:text-[#d6ff00]" /> Bonus Link Applied
+                    </span>
+                  )}
+                </label>
+                <div className="relative">
+                  <div className="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-gray-400">
+                    <Gift className="w-4 h-4 text-[#0a5c36] dark:text-[#d6ff00]" />
+                  </div>
+                  <input
+                    type="text"
+                    placeholder="e.g. EHUB7X or Friend's Code"
+                    value={signUpReferralCode}
+                    onChange={(e) => setSignUpReferralCode(e.target.value.toUpperCase())}
+                    className="w-full pl-10 pr-4 py-3 rounded-2xl border border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#09150f] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600 text-sm font-mono tracking-wider uppercase"
+                  />
+                </div>
+                <span className="text-[10.5px] text-gray-500 dark:text-gray-400 mt-1 block">
+                  Friend referred you? Enter their code so they receive their ₦100 reward.
+                </span>
+              </div>
+
+              <div className="p-3 rounded-xl bg-lime-50 dark:bg-green-950/70 border border-lime-200 dark:border-green-800/60 text-[#0a5c36] dark:text-lime-300 text-xs font-medium">
                 🎁 New accounts get a starting demo balance of <strong>₦1,250.00</strong> immediately!
               </div>
 
               <button
                 type="submit"
-                className="w-full py-3.5 bg-[#0a5c36] hover:bg-[#074729] text-white font-bold rounded-2xl shadow-md shadow-green-900/10 active:scale-[0.99] transition text-sm cursor-pointer"
+                className="w-full py-3.5 bg-[#0a5c36] hover:bg-[#074729] dark:bg-green-700 dark:hover:bg-green-600 text-white font-bold rounded-2xl shadow-md shadow-green-900/10 active:scale-[0.99] transition text-sm cursor-pointer"
               >
                 Create Account
               </button>
@@ -1085,7 +1865,7 @@ export default function App() {
           ) : (
             <form onSubmit={handleSignIn} className="space-y-4">
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   Email Address
                 </label>
                 <input
@@ -1094,12 +1874,12 @@ export default function App() {
                   placeholder="you@example.com"
                   value={signInEmail}
                   onChange={(e) => setSignInEmail(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] text-sm"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#09150f] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600 text-sm"
                 />
               </div>
 
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   Password
                 </label>
                 <input
@@ -1108,22 +1888,49 @@ export default function App() {
                   placeholder="••••••••"
                   value={signInPassword}
                   onChange={(e) => setSignInPassword(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-200 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] text-sm"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#09150f] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600 text-sm"
                 />
               </div>
 
               <button
                 type="submit"
-                className="w-full py-3.5 bg-[#0a5c36] hover:bg-[#074729] text-white font-bold rounded-2xl shadow-md shadow-green-900/10 active:scale-[0.99] transition text-sm cursor-pointer"
+                className="w-full py-3.5 bg-[#0a5c36] hover:bg-[#074729] dark:bg-green-700 dark:hover:bg-green-600 text-white font-bold rounded-2xl shadow-md shadow-green-900/10 active:scale-[0.99] transition text-sm cursor-pointer"
               >
                 Sign In to eHUB
               </button>
+
+              {/* Biometric One-Tap Sign In with Fingerprint / Face ID */}
+              <div className="pt-2">
+                <div className="relative flex py-2 items-center">
+                  <div className="flex-grow border-t border-gray-200 dark:border-green-900/40"></div>
+                  <span className="flex-shrink mx-3 text-[11px] font-bold text-gray-400 dark:text-gray-400 uppercase tracking-wider">
+                    or quick biometric unlock
+                  </span>
+                  <div className="flex-grow border-t border-gray-200 dark:border-green-900/40"></div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={handleBiometricSignIn}
+                  disabled={biometricLoading}
+                  className="w-full py-3.5 bg-gradient-to-r from-[#d6ff00] to-lime-400 hover:from-lime-300 hover:to-lime-200 text-[#0a5c36] font-black rounded-2xl shadow-md shadow-lime-500/15 active:scale-[0.99] transition text-sm flex items-center justify-center gap-2.5 cursor-pointer border border-lime-400/80"
+                >
+                  <Fingerprint className="w-5 h-5 text-[#0a5c36]" />
+                  <span>{biometricLoading ? 'Verifying Biometrics...' : 'Sign in with Fingerprint / Face ID'}</span>
+                </button>
+
+                {savedBiometricUser && (
+                  <p className="text-[11px] text-center text-gray-500 dark:text-gray-400 mt-2 font-medium">
+                    Enrolled for <span className="font-semibold text-gray-800 dark:text-gray-200">{savedBiometricUser.email}</span>
+                  </p>
+                )}
+              </div>
             </form>
           )}
 
           {/* Footer note */}
-          <div className="mt-8 pt-4 border-t border-gray-100 text-center">
-            <p className="text-xs text-gray-500 font-medium">
+          <div className="mt-8 pt-4 border-t border-gray-100 dark:border-green-900/40 text-center">
+            <p className="text-xs text-gray-500 dark:text-gray-400 font-medium">
               Powered by ClubKonnect API &amp; Paystack
             </p>
           </div>
@@ -1132,300 +1939,741 @@ export default function App() {
     );
   }
 
+  const unreadNotificationsCount = notifications.filter((n) => !n.read).length;
+
   // ----------------------------------------------------
   // MAIN APP INTERFACE (Mobile-First, max-width 480px)
   // ----------------------------------------------------
   return (
-    <div className="min-h-screen bg-[#eef5ef] flex flex-col items-center justify-start py-0 sm:py-6 px-0 sm:px-4">
-      <div className="w-full max-w-[480px] bg-white sm:rounded-[28px] shadow-2xl flex flex-col min-h-screen sm:min-h-[840px] overflow-hidden border sm:border-gray-200/80">
-        {/* TOP BAR / HEADER */}
-        <header className="bg-[#0a5c36] text-white px-5 py-4 flex items-center justify-between shadow-sm">
-          {/* Logo */}
+    <div className="min-h-screen bg-grain-green flex flex-col items-center justify-start py-6 sm:py-10 px-3 sm:px-6 transition-colors duration-200 font-sans text-gray-900 dark:text-gray-100">
+      <div className="w-full max-w-3xl space-y-6 sm:space-y-8 relative pb-28">
+        {/* FLOATING IN-APP PUSH NOTIFICATION TOAST */}
+        {activeToastNotification && (
+          <div className="z-50 animate-in slide-in-from-top-4 fade-in duration-300">
+            <div
+              onClick={() => {
+                if (activeToastNotification.type === 'low_balance') {
+                  setIsFundModalOpen(true);
+                } else if (activeToastNotification.metadata?.transactionId) {
+                  const match = transactions.find(
+                    (t) => t.transactionId === activeToastNotification.metadata?.transactionId
+                  );
+                  if (match) setSuccessReceipt(match);
+                } else {
+                  setIsNotificationDrawerOpen(true);
+                }
+                setActiveToastNotification(null);
+              }}
+              className={`p-4 rounded-[22px] shadow-soft-lg backdrop-blur-md border cursor-pointer flex items-start gap-3 transition-transform active:scale-[0.99] ${
+                activeToastNotification.type === 'low_balance'
+                  ? 'bg-amber-600/95 text-white border-amber-300 shadow-amber-950/40'
+                  : 'bg-[#0a5c36]/95 text-white border-lime-400 shadow-green-950/50'
+              }`}
+            >
+              <div
+                className={`w-10 h-10 rounded-2xl flex items-center justify-center shrink-0 shadow-xs ${
+                  activeToastNotification.type === 'low_balance'
+                    ? 'bg-white/20 text-white'
+                    : 'bg-[#d6ff00] text-[#0a5c36]'
+                }`}
+              >
+                {activeToastNotification.type === 'low_balance' ? (
+                  <AlertCircle className="w-5 h-5 text-amber-100" />
+                ) : (
+                  <BellRing className="w-5 h-5 text-[#0a5c36]" />
+                )}
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-black tracking-wide truncate">
+                    {activeToastNotification.title}
+                  </span>
+                  <span className="text-[10px] text-white/80 font-mono">Just now</span>
+                </div>
+                <p className="text-[11px] text-white/90 leading-snug mt-0.5 line-clamp-2">
+                  {activeToastNotification.body}
+                </p>
+                <div className="mt-1 flex items-center gap-2">
+                  <span className="text-[10px] underline font-extrabold text-white">
+                    {activeToastNotification.type === 'low_balance'
+                      ? '⚡ Tap to Fund Wallet Now →'
+                      : '📄 Tap to View Receipt →'}
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setActiveToastNotification(null);
+                }}
+                className="w-6 h-6 rounded-full bg-white/20 hover:bg-white/30 text-white flex items-center justify-center text-xs shrink-0 cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* eHUB HEADER CARD (Flat white rounded-24px with soft shadow) */}
+        <header className="bg-white dark:bg-[#0e2116] rounded-[24px] shadow-soft p-4 sm:p-5 flex flex-wrap items-center justify-between gap-4 border border-white/60 dark:border-green-900/40 transition-colors">
+          {/* Logo & Brand */}
           <div
-            onClick={() => setActivePage('dashboard')}
-            className="flex items-center gap-2.5 cursor-pointer select-none"
+            onClick={() => {
+              setActivePage('dashboard');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
+            className="flex items-center gap-3 cursor-pointer select-none"
           >
-            <div className="w-9 h-9 rounded-xl bg-[#d6ff00] flex items-center justify-center shadow-md transform -rotate-8 border border-lime-300">
-              <span className="font-extrabold text-2xl text-[#0a5c36]">e</span>
+            <div className="w-12 h-12 rounded-2xl bg-white p-1 flex items-center justify-center shadow-xs border border-gray-100 overflow-hidden shrink-0">
+              <img
+                src={CONFIG.LOGO_URL}
+                alt="eHUB Logo"
+                className="w-full h-full object-contain"
+              />
             </div>
             <div>
-              <div className="flex items-baseline font-black tracking-tight text-2xl leading-none">
-                <span className="text-[#d6ff00]">e</span>
-                <span className="text-white">HUB</span>
+              <div className="flex items-baseline font-heading font-sora font-extrabold text-2xl tracking-tight leading-none text-gray-900 dark:text-white">
+                <span className="text-[#0FA958]">e</span>
+                <span>HUB</span>
               </div>
-              <span className="text-[10px] text-green-200 font-semibold tracking-wider uppercase block mt-0.5">
+              <span className="text-[11px] text-gray-500 dark:text-gray-400 font-medium tracking-tight block mt-0.5">
                 {CONFIG.SLOGAN}
               </span>
             </div>
           </div>
 
-          {/* Right Action: User Info & Logout */}
-          <div className="flex items-center gap-2">
-            <button
-              onClick={() => setIsConfigInfoOpen(true)}
-              title="API Configuration"
-              className="p-2 rounded-xl bg-green-800/60 hover:bg-green-700 text-lime-300 transition"
-            >
-              <Info className="w-4 h-4" />
-            </button>
-            <div className="text-right hidden sm:block">
-              <span className="text-xs font-semibold block text-white truncate max-w-[110px]">
-                {currentUser.displayName}
+          {/* Balance Pill & Actions */}
+          <div className="flex items-center gap-2.5 sm:gap-3 flex-wrap">
+            <div className="flex items-center gap-2 bg-[#f0f9f3] dark:bg-[#12281c] px-3.5 py-2 rounded-[18px] border border-green-100 dark:border-green-900/50">
+              <span className="text-xs text-gray-500 dark:text-gray-400 font-medium hidden sm:inline">Balance:</span>
+              <span className="font-heading font-sora font-extrabold text-sm text-[#0FA958]">
+                ₦{currentUser.balance.toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
               </span>
-              <span className="text-[10px] text-green-200 block truncate max-w-[110px]">
-                {currentUser.email}
-              </span>
+              <button
+                onClick={() => setIsFundModalOpen(true)}
+                className="ml-1 bg-[#0FA958] hover:bg-[#0c8f49] text-white text-[11px] font-bold px-2.5 py-1 rounded-xl transition cursor-pointer"
+              >
+                + Fund
+              </button>
             </div>
+
+            {/* Notifications */}
+            <button
+              onClick={() => setIsNotificationDrawerOpen(true)}
+              aria-label="View notifications and alerts"
+              title="Notifications & Alerts"
+              className="relative p-2.5 rounded-2xl bg-gray-100 dark:bg-green-950/60 hover:bg-gray-200 dark:hover:bg-green-900/60 text-gray-700 dark:text-lime-300 transition-all active:scale-95 flex items-center justify-center cursor-pointer border border-transparent dark:border-green-800/40"
+            >
+              <Bell className="w-4 h-4 text-[#0FA958] dark:text-[#d6ff00]" />
+              {unreadNotificationsCount > 0 && (
+                <span className="absolute -top-1 -right-1 min-w-[18px] h-[18px] bg-red-500 text-white font-black text-[10px] rounded-full flex items-center justify-center px-1 shadow-xs animate-pulse">
+                  {unreadNotificationsCount > 9 ? '9+' : unreadNotificationsCount}
+                </span>
+              )}
+            </button>
+
+            {/* Dark Mode Toggle */}
+            <button
+              onClick={toggleTheme}
+              aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+              title={theme === 'dark' ? 'Switch to Light Mode' : 'Switch to Dark Mode'}
+              className="p-2.5 rounded-2xl bg-gray-100 dark:bg-green-950/60 hover:bg-gray-200 dark:hover:bg-green-900/60 text-gray-700 dark:text-lime-300 transition-all active:scale-95 flex items-center justify-center cursor-pointer border border-transparent dark:border-green-800/40"
+            >
+              {theme === 'dark' ? (
+                <Sun className="w-4 h-4 text-[#d6ff00] transition-transform duration-300 hover:rotate-45" />
+              ) : (
+                <Moon className="w-4 h-4 text-[#0FA958] transition-transform duration-300 hover:-rotate-12" />
+              )}
+            </button>
+
+            {/* Settings */}
+            <button
+              onClick={() => setActivePage('settings')}
+              aria-label="Settings & Security"
+              title="Settings & Security"
+              className={`p-2.5 rounded-2xl transition cursor-pointer border ${
+                activePage === 'settings'
+                  ? 'bg-[#0FA958] text-white border-[#0FA958] shadow-sm'
+                  : 'bg-gray-100 dark:bg-green-950/60 hover:bg-gray-200 dark:hover:bg-green-900/60 text-gray-700 dark:text-lime-300 border-transparent dark:border-green-800/40'
+              }`}
+            >
+              <Settings className="w-4 h-4" />
+            </button>
+
+            {/* Sign out */}
             <button
               onClick={handleLogout}
               title="Sign Out"
-              className="p-2 rounded-xl bg-green-800/60 hover:bg-red-700/80 text-white transition cursor-pointer"
+              className="p-2.5 rounded-2xl bg-gray-100 dark:bg-green-950/60 hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950 text-gray-600 dark:text-gray-300 transition cursor-pointer"
             >
               <LogOut className="w-4 h-4" />
             </button>
           </div>
         </header>
 
-        {/* SUBHEADER NOTICE BANNER */}
-        <div className="bg-[#d6ff00] text-[#0a5c36] px-4 py-1.5 text-xs font-bold flex items-center justify-between border-b border-lime-400">
-          <div className="flex items-center gap-1.5 truncate">
-            <span className="w-2 h-2 rounded-full bg-[#0a5c36] animate-ping"></span>
-            <span>⚡ AEDC Light Tokens &amp; SME Data Instant Dispense</span>
-          </div>
-          <button
-            onClick={() => setActivePage('history')}
-            className="text-[11px] underline underline-offset-2 shrink-0 font-extrabold"
-          >
-            History ({transactions.length})
-          </button>
-        </div>
-
-        {/* MAIN BODY AREA */}
-        <main className="flex-1 p-4 sm:p-5 overflow-y-auto">
-          {/* ==================================================== */}
-          {/* 1. DASHBOARD HOME PAGE                               */}
-          {/* ==================================================== */}
+        {/* ==================================================== */}
+        {/* MAIN BODY AREA                                       */}
+        {/* ==================================================== */}
+        <main className="space-y-6 sm:space-y-8">
           {activePage === 'dashboard' && (
-            <div className="space-y-5">
-              {/* WALLET CARD */}
-              <div className="relative overflow-hidden rounded-[24px] bg-gradient-to-br from-[#0a5c36] via-[#0d6e41] to-[#073d24] text-white p-5 shadow-lg shadow-green-900/20 border border-green-700/50">
-                <div className="absolute -top-10 -right-10 w-36 h-36 bg-[#d6ff00]/10 rounded-full blur-xl pointer-events-none"></div>
-                <div className="absolute -bottom-10 -left-10 w-36 h-36 bg-black/20 rounded-full blur-lg pointer-events-none"></div>
-
-                <div className="relative z-10 flex items-start justify-between mb-4">
+            <div className="space-y-6 sm:space-y-8">
+              {/* ==================================================== */}
+              {/* SECTION 1: RECHARGE AIRTIME                          */}
+              {/* ==================================================== */}
+              <section
+                id="section-airtime"
+                className="bg-white dark:bg-[#0e2116] rounded-[24px] shadow-soft p-6 sm:p-8 space-y-6 border border-white/60 dark:border-green-900/40 transition-colors"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-gray-100 dark:border-green-900/40">
                   <div>
-                    <span className="text-[11px] font-bold tracking-wider text-green-200 uppercase flex items-center gap-1.5">
-                      <Wallet className="w-3.5 h-3.5 text-[#d6ff00]" />
-                      Available Balance
+                    <h2 className="font-heading font-sora font-extrabold text-2xl sm:text-3xl text-gray-900 dark:text-white tracking-tight">
+                      Recharge Airtime
+                    </h2>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                      Instant VTU Recharge with 2% Automatic Cashback on All Networks
+                    </p>
+                  </div>
+                  <span className="px-3 py-1 rounded-full bg-[#e8f7ee] dark:bg-green-950/80 text-[#0FA958] dark:text-lime-300 text-xs font-bold font-mono">
+                    2% Rebate Applied
+                  </span>
+                </div>
+
+                {/* Select Network */}
+                <div>
+                  <label className="block text-xs font-heading font-sora font-extrabold text-gray-700 dark:text-gray-200 uppercase tracking-wider mb-3">
+                    Select Network
+                  </label>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    {/* MTN */}
+                    <button
+                      type="button"
+                      onClick={() => setAirtimeNetwork('MTN')}
+                      className={`p-4 rounded-2xl border-2 transition-all flex flex-col items-center justify-center gap-2 cursor-pointer relative ${
+                        airtimeNetwork === 'MTN'
+                          ? 'border-[#0FA958] bg-[#f0f9f3] dark:bg-green-950/40 ring-2 ring-[#0FA958]/20 shadow-xs'
+                          : 'border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#12241b] hover:border-gray-300'
+                      }`}
+                    >
+                      <div className="w-10 h-10 rounded-full bg-[#FFCC00] text-black font-heading font-sora font-extrabold flex items-center justify-center text-xs shadow-xs">
+                        MTN
+                      </div>
+                      <span className="font-heading font-sora font-extrabold text-sm text-gray-900 dark:text-white">
+                        MTN
+                      </span>
+                      <span className="text-[10px] font-bold text-[#0FA958] bg-[#e7f7ed] dark:bg-green-950 px-2 py-0.5 rounded-full">
+                        2% OFF
+                      </span>
+                      {airtimeNetwork === 'MTN' && (
+                        <div className="absolute top-2 right-2 w-4 h-4 rounded-full bg-[#0FA958] text-white flex items-center justify-center text-[10px]">
+                          ✓
+                        </div>
+                      )}
+                    </button>
+
+                    {/* GLO */}
+                    <button
+                      type="button"
+                      onClick={() => setAirtimeNetwork('GLO')}
+                      className={`p-4 rounded-2xl border-2 transition-all flex flex-col items-center justify-center gap-2 cursor-pointer relative ${
+                        airtimeNetwork === 'GLO'
+                          ? 'border-[#0FA958] bg-[#f0f9f3] dark:bg-green-950/40 ring-2 ring-[#0FA958]/20 shadow-xs'
+                          : 'border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#12241b] hover:border-gray-300'
+                      }`}
+                    >
+                      <div className="w-10 h-10 rounded-full bg-[#228B22] text-white font-heading font-sora font-extrabold flex items-center justify-center text-xs shadow-xs">
+                        GLO
+                      </div>
+                      <span className="font-heading font-sora font-extrabold text-sm text-gray-900 dark:text-white">
+                        GLO
+                      </span>
+                      <span className="text-[10px] font-bold text-[#0FA958] bg-[#e7f7ed] dark:bg-green-950 px-2 py-0.5 rounded-full">
+                        2% OFF
+                      </span>
+                      {airtimeNetwork === 'GLO' && (
+                        <div className="absolute top-2 right-2 w-4 h-4 rounded-full bg-[#0FA958] text-white flex items-center justify-center text-[10px]">
+                          ✓
+                        </div>
+                      )}
+                    </button>
+
+                    {/* AIRTEL */}
+                    <button
+                      type="button"
+                      onClick={() => setAirtimeNetwork('AIRTEL')}
+                      className={`p-4 rounded-2xl border-2 transition-all flex flex-col items-center justify-center gap-2 cursor-pointer relative ${
+                        airtimeNetwork === 'AIRTEL'
+                          ? 'border-[#0FA958] bg-[#f0f9f3] dark:bg-green-950/40 ring-2 ring-[#0FA958]/20 shadow-xs'
+                          : 'border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#12241b] hover:border-gray-300'
+                      }`}
+                    >
+                      <div className="w-10 h-10 rounded-full bg-[#E60000] text-white font-heading font-sora font-extrabold flex items-center justify-center text-xs shadow-xs">
+                        airtel
+                      </div>
+                      <span className="font-heading font-sora font-extrabold text-sm text-gray-900 dark:text-white">
+                        Airtel
+                      </span>
+                      <span className="text-[10px] font-bold text-[#0FA958] bg-[#e7f7ed] dark:bg-green-950 px-2 py-0.5 rounded-full">
+                        2% OFF
+                      </span>
+                      {airtimeNetwork === 'AIRTEL' && (
+                        <div className="absolute top-2 right-2 w-4 h-4 rounded-full bg-[#0FA958] text-white flex items-center justify-center text-[10px]">
+                          ✓
+                        </div>
+                      )}
+                    </button>
+
+                    {/* 9MOBILE */}
+                    <button
+                      type="button"
+                      onClick={() => setAirtimeNetwork('9MOBILE')}
+                      className={`p-4 rounded-2xl border-2 transition-all flex flex-col items-center justify-center gap-2 cursor-pointer relative ${
+                        airtimeNetwork === '9MOBILE'
+                          ? 'border-[#0FA958] bg-[#f0f9f3] dark:bg-green-950/40 ring-2 ring-[#0FA958]/20 shadow-xs'
+                          : 'border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#12241b] hover:border-gray-300'
+                      }`}
+                    >
+                      <div className="w-10 h-10 rounded-full bg-[#004730] text-[#cbed34] font-heading font-sora font-extrabold flex items-center justify-center text-[10px] shadow-xs">
+                        9mob
+                      </div>
+                      <span className="font-heading font-sora font-extrabold text-sm text-gray-900 dark:text-white">
+                        9mobile
+                      </span>
+                      <span className="text-[10px] font-bold text-[#0FA958] bg-[#e7f7ed] dark:bg-green-950 px-2 py-0.5 rounded-full">
+                        2% OFF
+                      </span>
+                      {airtimeNetwork === '9MOBILE' && (
+                        <div className="absolute top-2 right-2 w-4 h-4 rounded-full bg-[#0FA958] text-white flex items-center justify-center text-[10px]">
+                          ✓
+                        </div>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Recipient Phone Number */}
+                <div>
+                  <label className="block text-xs font-heading font-sora font-extrabold text-gray-700 dark:text-gray-200 uppercase tracking-wider mb-2">
+                    Recipient Phone Number
+                  </label>
+                  <div className="relative">
+                    <input
+                      type="tel"
+                      value={airtimePhone}
+                      onChange={(e) => setAirtimePhone(e.target.value.replace(/\D/g, '').slice(0, 11))}
+                      placeholder="e.g. 08012345678"
+                      className="w-full px-4 py-3.5 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white font-mono text-base focus:outline-none focus:ring-2 focus:ring-[#0FA958]"
+                    />
+                    {airtimePhone.length >= 4 && (
+                      <span className="absolute right-3.5 top-3.5 text-xs font-bold text-[#0FA958] bg-[#e7f7ed] dark:bg-green-950 px-2.5 py-1 rounded-full">
+                        {detectNetworkFromPhone(airtimePhone)}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                {/* Select Amount (N200, N500, N1000, N2000, N5000 with N1000 selected green) */}
+                <div>
+                  <div className="flex items-center justify-between mb-2.5">
+                    <label className="text-xs font-heading font-sora font-extrabold text-gray-700 dark:text-gray-200 uppercase tracking-wider">
+                      Select Amount
+                    </label>
+                    <span className="text-xs text-gray-500 dark:text-gray-400">
+                      You pay: <strong className="text-[#0FA958] font-heading font-sora font-extrabold">₦{Math.round(airtimeAmount * 0.98).toLocaleString()}</strong>
                     </span>
-                    <h2 className="text-3xl font-black tracking-tight text-white mt-1">
-                      ₦
-                      {currentUser.balance.toLocaleString('en-NG', {
+                  </div>
+                  <div className="grid grid-cols-5 gap-2 sm:gap-3">
+                    {[200, 500, 1000, 2000, 5000].map((amt) => {
+                      const isSelected = airtimeAmount === amt;
+                      return (
+                        <button
+                          key={amt}
+                          type="button"
+                          onClick={() => setAirtimeAmount(amt)}
+                          className={`py-3.5 px-2 rounded-2xl font-heading font-sora text-sm sm:text-base transition-all cursor-pointer border ${
+                            isSelected
+                              ? 'bg-[#0FA958] text-white font-extrabold border-[#0FA958] shadow-md ring-2 ring-[#0FA958]/30 scale-[1.02]'
+                              : 'bg-gray-50 dark:bg-[#12241b] text-gray-800 dark:text-gray-200 font-bold border-gray-200 dark:border-green-900/50 hover:border-[#0FA958]'
+                          }`}
+                        >
+                          ₦{amt.toLocaleString()}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Action error banner */}
+                {actionError && (
+                  <div className="p-3.5 rounded-2xl bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-900/60 text-red-700 dark:text-red-300 text-xs flex items-start gap-2">
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                    <span>{actionError}</span>
+                  </div>
+                )}
+
+                {/* Green Continue Button */}
+                <button
+                  type="button"
+                  onClick={buyAirtime}
+                  disabled={actionLoading}
+                  className="w-full py-4 px-6 rounded-[18px] bg-[#0FA958] hover:bg-[#0c8f49] disabled:bg-gray-300 dark:disabled:bg-gray-800 text-white font-heading font-sora font-extrabold text-base shadow-soft transition-all active:scale-[0.99] flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  {actionLoading ? (
+                    <>
+                      <RefreshCw className="w-5 h-5 animate-spin" />
+                      <span>Processing Recharge...</span>
+                    </>
+                  ) : (
+                    <span>Continue (Pay ₦{Math.round(airtimeAmount * 0.98).toLocaleString()})</span>
+                  )}
+                </button>
+              </section>
+
+              {/* ==================================================== */}
+              {/* SECTION 2: AFFORDABLE DATA SUBSCRIPTIONS             */}
+              {/* ==================================================== */}
+              <section
+                id="section-data"
+                className="bg-white dark:bg-[#0e2116] rounded-[24px] shadow-soft p-6 sm:p-8 space-y-6 border border-white/60 dark:border-green-900/40 transition-colors"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3 pb-2 border-b border-gray-100 dark:border-green-900/40">
+                  <div>
+                    <h2 className="font-heading font-sora font-extrabold text-2xl sm:text-3xl text-gray-900 dark:text-white tracking-tight">
+                      Affordable Data Subscriptions
+                    </h2>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                      Direct SME &amp; Corporate Gifting Data with Instant 24/7 Dispense
+                    </p>
+                  </div>
+                  {/* Available Balance Pill */}
+                  <div className="flex items-center gap-2 bg-[#f0f9f3] dark:bg-green-950/60 px-3.5 py-1.5 rounded-full border border-green-200 dark:border-green-900/60">
+                    <span className="text-xs text-gray-600 dark:text-gray-300 font-medium">Available Balance:</span>
+                    <strong className="font-heading font-sora font-extrabold text-sm text-[#0FA958]">
+                      ₦{currentUser.balance.toLocaleString('en-NG', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </strong>
+                    <button
+                      type="button"
+                      onClick={() => setIsFundModalOpen(true)}
+                      className="ml-1 bg-[#0FA958] hover:bg-[#0c8f49] text-white text-[11px] font-bold px-2 py-0.5 rounded-lg transition"
+                    >
+                      + Top Up
+                    </button>
+                  </div>
+                </div>
+
+                {/* Network Filter Pills (All Network pill green) */}
+                <div>
+                  <label className="block text-xs font-heading font-sora font-extrabold text-gray-700 dark:text-gray-200 uppercase tracking-wider mb-2.5">
+                    Filter by Network
+                  </label>
+                  <div className="flex flex-wrap items-center gap-2">
+                    {(['ALL', 'MTN', 'GLO', 'AIRTEL', '9MOBILE'] as const).map((net) => {
+                      const isSelected = dataNetworkFilter === net;
+                      return (
+                        <button
+                          key={net}
+                          type="button"
+                          onClick={() => {
+                            setDataNetworkFilter(net);
+                            if (net !== 'ALL') setSelectedNetwork(net);
+                          }}
+                          className={`px-4 py-2 rounded-full font-heading font-sora text-xs transition-all cursor-pointer border ${
+                            isSelected
+                              ? 'bg-[#0FA958] text-white font-extrabold border-[#0FA958] shadow-xs'
+                              : 'bg-gray-100 dark:bg-[#12241b] text-gray-700 dark:text-gray-300 font-bold border-gray-200 dark:border-green-900/50 hover:border-[#0FA958]'
+                          }`}
+                        >
+                          {net === 'ALL' ? 'All Network' : net}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Buy Data Cards (1GB N300, 3GB N850, 5GB N1400 with VALID 30 DAYS) */}
+                <div>
+                  <label className="block text-xs font-heading font-sora font-extrabold text-gray-700 dark:text-gray-200 uppercase tracking-wider mb-3">
+                    Buy Data Plans
+                  </label>
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                    {(
+                      (dataNetworkFilter === 'ALL'
+                        ? DATA_PLANS.ALL
+                        : DATA_PLANS[dataNetworkFilter]) || DATA_PLANS.ALL
+                    ).map((plan) => {
+                      const isSelected = selectedDataPlanId === plan.id;
+                      return (
+                        <div
+                          key={plan.id}
+                          onClick={() => {
+                            setSelectedDataPlanId(plan.id);
+                            if (plan.network) setSelectedNetwork(plan.network);
+                          }}
+                          className={`p-5 rounded-[22px] border-2 transition-all cursor-pointer relative flex flex-col justify-between gap-3 ${
+                            isSelected
+                              ? 'border-[#0FA958] bg-[#f0f9f3] dark:bg-green-950/40 ring-2 ring-[#0FA958]/20 shadow-soft'
+                              : 'border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#12241b] hover:border-gray-300'
+                          }`}
+                        >
+                          <div className="flex items-start justify-between">
+                            <div>
+                              <span className="text-xs font-bold text-gray-500 dark:text-gray-400 block">
+                                {plan.network} SME Data
+                              </span>
+                              <span className="font-heading font-sora font-extrabold text-2xl text-gray-900 dark:text-white mt-1 block">
+                                {plan.size}
+                              </span>
+                            </div>
+                            <span className="bg-[#e7f7ed] dark:bg-green-950 text-[#0FA958] dark:text-lime-300 font-bold text-[10px] uppercase tracking-wider px-2.5 py-1 rounded-full">
+                              VALID {plan.validity || '30 DAYS'}
+                            </span>
+                          </div>
+
+                          <div className="pt-2 border-t border-gray-100 dark:border-green-900/30 flex items-center justify-between">
+                            <span className="font-heading font-sora font-extrabold text-xl text-[#0FA958]">
+                              ₦{plan.price.toLocaleString()}
+                            </span>
+                            <span
+                              className={`text-xs font-bold px-2 py-0.5 rounded-lg ${
+                                isSelected
+                                  ? 'bg-[#0FA958] text-white'
+                                  : 'text-gray-400 group-hover:text-gray-600'
+                              }`}
+                            >
+                              {isSelected ? 'Selected ✓' : 'Select'}
+                            </span>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+
+                {/* Recipient Phone for Data */}
+                <div>
+                  <label className="block text-xs font-heading font-sora font-extrabold text-gray-700 dark:text-gray-200 uppercase tracking-wider mb-2">
+                    Recipient Phone Number
+                  </label>
+                  <input
+                    type="tel"
+                    value={dataPhone}
+                    onChange={(e) => setDataPhone(e.target.value.replace(/\D/g, '').slice(0, 11))}
+                    placeholder="e.g. 08012345678"
+                    className="w-full px-4 py-3.5 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white font-mono text-base focus:outline-none focus:ring-2 focus:ring-[#0FA958]"
+                  />
+                </div>
+
+                {/* Green Buy Now Button */}
+                <button
+                  type="button"
+                  onClick={buyData}
+                  disabled={actionLoading}
+                  className="w-full py-4 px-6 rounded-[18px] bg-[#0FA958] hover:bg-[#0c8f49] disabled:bg-gray-300 dark:disabled:bg-gray-800 text-white font-heading font-sora font-extrabold text-base shadow-soft transition-all active:scale-[0.99] flex items-center justify-center gap-2 cursor-pointer"
+                >
+                  {actionLoading ? (
+                    <>
+                      <RefreshCw className="w-5 h-5 animate-spin" />
+                      <span>Dispensing Data Bundle...</span>
+                    </>
+                  ) : (
+                    <span>Buy Now • Instant Dispense</span>
+                  )}
+                </button>
+              </section>
+
+              {/* ==================================================== */}
+              {/* SECTION 3: GET REWARDED WITH CASHBACK                */}
+              {/* ==================================================== */}
+              <section
+                id="section-cashback"
+                className="bg-white dark:bg-[#0e2116] rounded-[24px] shadow-soft p-6 sm:p-8 space-y-6 border border-white/60 dark:border-green-900/40 transition-colors"
+              >
+                <div className="flex flex-wrap items-center justify-between gap-3 pb-2 border-b border-gray-100 dark:border-green-900/40">
+                  <div>
+                    <h2 className="font-heading font-sora font-extrabold text-2xl sm:text-3xl text-gray-900 dark:text-white tracking-tight">
+                      Get Rewarded with Cashback
+                    </h2>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                      Enjoy automatic recharge rebates, wholesale margins, and ₦100 referral bonuses.
+                    </p>
+                  </div>
+                  <span className="px-3 py-1 rounded-full bg-[#e8f7ee] dark:bg-green-950 text-[#0FA958] dark:text-lime-300 text-xs font-bold">
+                    Rewards Program
+                  </span>
+                </div>
+
+                {/* Total Cashback Banner Card */}
+                <div className="rounded-[22px] bg-gradient-to-br from-[#0FA958] to-[#0b8042] text-white p-6 shadow-soft flex flex-wrap items-center justify-between gap-4">
+                  <div>
+                    <span className="text-xs font-bold uppercase tracking-wider text-green-100 flex items-center gap-1.5">
+                      <Sparkles className="w-4 h-4 text-lime-200" />
+                      Total Cashback
+                    </span>
+                    <h3 className="font-heading font-sora font-extrabold text-3xl sm:text-4xl text-white mt-1">
+                      ₦{(currentUser.referralEarnings ?? 850.0).toLocaleString('en-NG', {
                         minimumFractionDigits: 2,
                         maximumFractionDigits: 2,
                       })}
-                    </h2>
+                    </h3>
+                    <p className="text-xs text-green-100 mt-1">
+                      Credited directly into your active wallet balance.
+                    </p>
                   </div>
                   <button
+                    type="button"
                     onClick={() => setIsFundModalOpen(true)}
-                    className="flex items-center gap-1.5 bg-[#d6ff00] hover:bg-lime-400 text-[#0a5c36] px-4 py-2 rounded-2xl font-black text-xs shadow-md active:scale-95 transition cursor-pointer"
+                    className="px-5 py-3 rounded-2xl bg-white text-[#0FA958] font-heading font-sora font-extrabold text-xs shadow-md hover:bg-green-50 transition cursor-pointer"
                   >
-                    <PlusCircle className="w-4 h-4 text-[#0a5c36]" />
-                    <span>FUND</span>
+                    + Use Cashback
                   </button>
                 </div>
 
-                <div className="relative z-10 pt-3 border-t border-green-700/60 flex items-center justify-between text-[11px] text-green-200">
-                  <span className="flex items-center gap-1">
-                    <ShieldCheck className="w-3.5 h-3.5 text-[#d6ff00]" />
-                    Verified eHUB Wallet
-                  </span>
-                  <span className="font-mono text-green-300">
-                    ID: {currentUser.userId.slice(0, 10)}
-                  </span>
-                </div>
-              </div>
-
-              {/* ABUJA HERO TAG */}
-              <div className="bg-[#eef5ef] rounded-2xl p-3 flex items-center justify-between border border-green-200/60 text-xs">
-                <div className="flex items-center gap-2">
-                  <div className="w-7 h-7 rounded-lg bg-[#0a5c36] text-[#d6ff00] flex items-center justify-center font-bold">
-                    <Building2 className="w-4 h-4" />
+                {/* 3 Cashback & Rewards Feature Tiles */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                  <div className="p-4 rounded-2xl bg-gray-50 dark:bg-[#12241b] border border-gray-100 dark:border-green-900/40 space-y-1">
+                    <div className="w-8 h-8 rounded-xl bg-green-100 dark:bg-green-950 text-[#0FA958] flex items-center justify-center font-bold text-sm mb-2">
+                      ⚡
+                    </div>
+                    <span className="font-heading font-sora font-extrabold text-sm text-gray-900 dark:text-white block">
+                      2% Airtime Cashback
+                    </span>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+                      Automatically subtracted at checkout for MTN, GLO, Airtel and 9mobile.
+                    </p>
                   </div>
+
+                  <div className="p-4 rounded-2xl bg-gray-50 dark:bg-[#12241b] border border-gray-100 dark:border-green-900/40 space-y-1">
+                    <div className="w-8 h-8 rounded-xl bg-blue-100 dark:bg-blue-950 text-blue-600 flex items-center justify-center font-bold text-sm mb-2">
+                      📡
+                    </div>
+                    <span className="font-heading font-sora font-extrabold text-sm text-gray-900 dark:text-white block">
+                      Wholesale Data
+                    </span>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+                      Save up to ₦200 per gigabyte compared to commercial telecom prices.
+                    </p>
+                  </div>
+
+                  <div className="p-4 rounded-2xl bg-gray-50 dark:bg-[#12241b] border border-gray-100 dark:border-green-900/40 space-y-1">
+                    <div className="w-8 h-8 rounded-xl bg-amber-100 dark:bg-amber-950 text-amber-600 flex items-center justify-center font-bold text-sm mb-2">
+                      🎁
+                    </div>
+                    <span className="font-heading font-sora font-extrabold text-sm text-gray-900 dark:text-white block">
+                      ₦100 Referral Bonus
+                    </span>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 leading-relaxed">
+                      Earn ₦100 instantly when a friend signs up with your referral code.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Referral Code Copy Card */}
+                <div className="p-4 rounded-2xl bg-[#f0f9f3] dark:bg-[#12281c] border border-green-200 dark:border-green-900/50 flex flex-wrap items-center justify-between gap-3">
                   <div>
-                    <span className="font-bold text-gray-900 block">Abuja Telecom Center</span>
-                    <span className="text-gray-500 text-[10px]">Wuse 2, FCT Abuja</span>
+                    <span className="text-[11px] font-bold text-[#0FA958] uppercase tracking-wider block">
+                      Your Referral Code
+                    </span>
+                    <span className="font-mono font-extrabold text-base text-gray-900 dark:text-white mt-0.5 block">
+                      {currentUser.referralCode || 'EHUB-BEN492'}
+                    </span>
                   </div>
-                </div>
-                <span className="px-2.5 py-1 rounded-full bg-green-100 text-[#0a5c36] font-bold text-[10px]">
-                  Lowest Rates in FCT
-                </span>
-              </div>
-
-              {/* 4 SERVICE BOXES IN 2x2 GRID */}
-              <div>
-                <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider mb-3">
-                  Select a Service
-                </h3>
-
-                <div className="grid grid-cols-2 gap-3.5">
-                  {/* a) Data Box */}
-                  <button
-                    onClick={() => setActivePage('data')}
-                    className="group relative flex flex-col items-start p-4 rounded-[22px] bg-gradient-to-br from-[#0a5c36] to-[#0f7a48] text-white shadow-md hover:shadow-lg transition-all active:scale-[0.98] text-left overflow-hidden cursor-pointer"
-                  >
-                    <div className="absolute top-2 right-2 w-7 h-7 rounded-full bg-white/10 flex items-center justify-center group-hover:bg-[#d6ff00] group-hover:text-[#0a5c36] transition">
-                      <ChevronRight className="w-4 h-4" />
-                    </div>
-                    <div className="w-11 h-11 rounded-2xl bg-[#d6ff00] text-[#0a5c36] flex items-center justify-center shadow-sm mb-3">
-                      <i className="fa-solid fa-signal text-xl"></i>
-                    </div>
-                    <span className="font-black text-lg text-white">Data</span>
-                    <span className="text-xs text-green-200 mt-0.5">
-                      MTN, GLO, Airtel, 9mobile
-                    </span>
-                    <span className="mt-2.5 inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-white/20 text-[#d6ff00]">
-                      From ₦220/GB
-                    </span>
-                  </button>
-
-                  {/* b) Airtime Box */}
-                  <button
-                    onClick={() => setActivePage('airtime')}
-                    className="group relative flex flex-col items-start p-4 rounded-[22px] bg-gradient-to-br from-blue-600 to-indigo-700 text-white shadow-md hover:shadow-lg transition-all active:scale-[0.98] text-left overflow-hidden cursor-pointer"
-                  >
-                    <div className="absolute top-2 right-2 w-7 h-7 rounded-full bg-white/10 flex items-center justify-center group-hover:bg-white group-hover:text-blue-700 transition">
-                      <ChevronRight className="w-4 h-4" />
-                    </div>
-                    <div className="w-11 h-11 rounded-2xl bg-blue-100 text-blue-700 flex items-center justify-center shadow-sm mb-3">
-                      <i className="fa-solid fa-phone text-xl"></i>
-                    </div>
-                    <span className="font-black text-lg text-white">Airtime</span>
-                    <span className="text-xs text-blue-100 mt-0.5">
-                      Instant VTU Recharge
-                    </span>
-                    <span className="mt-2.5 inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-[#d6ff00] text-[#0a5c36]">
-                      2% OFF
-                    </span>
-                  </button>
-
-                  {/* c) Electricity Box */}
-                  <button
-                    onClick={() => setActivePage('electricity')}
-                    className="group relative flex flex-col items-start p-4 rounded-[22px] bg-gradient-to-br from-amber-500 to-orange-600 text-white shadow-md hover:shadow-lg transition-all active:scale-[0.98] text-left overflow-hidden cursor-pointer"
-                  >
-                    <div className="absolute top-2 right-2 w-7 h-7 rounded-full bg-white/10 flex items-center justify-center group-hover:bg-white group-hover:text-orange-600 transition">
-                      <ChevronRight className="w-4 h-4" />
-                    </div>
-                    <div className="w-11 h-11 rounded-2xl bg-orange-100 text-orange-600 flex items-center justify-center shadow-sm mb-3">
-                      <i className="fa-solid fa-lightbulb text-xl"></i>
-                    </div>
-                    <span className="font-black text-lg text-white">Electricity</span>
-                    <span className="text-xs text-orange-100 mt-0.5">
-                      AEDC &amp; All Discos
-                    </span>
-                    <span className="mt-2.5 inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-white/20 text-white">
-                      Instant Token
-                    </span>
-                  </button>
-
-                  {/* d) GOTV/DSTV Box */}
-                  <button
-                    onClick={() => setActivePage('cable')}
-                    className="group relative flex flex-col items-start p-4 rounded-[22px] bg-gradient-to-br from-purple-600 to-violet-800 text-white shadow-md hover:shadow-lg transition-all active:scale-[0.98] text-left overflow-hidden cursor-pointer"
-                  >
-                    <div className="absolute top-2 right-2 w-7 h-7 rounded-full bg-white/10 flex items-center justify-center group-hover:bg-white group-hover:text-purple-700 transition">
-                      <ChevronRight className="w-4 h-4" />
-                    </div>
-                    <div className="w-11 h-11 rounded-2xl bg-purple-100 text-purple-700 flex items-center justify-center shadow-sm mb-3">
-                      <i className="fa-solid fa-tv text-xl"></i>
-                    </div>
-                    <span className="font-black text-lg text-white">GOTV/DSTV</span>
-                    <span className="text-xs text-purple-100 mt-0.5">
-                      TV Subscription
-                    </span>
-                    <span className="mt-2.5 inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-white/20 text-[#d6ff00]">
-                      Zero Fee
-                    </span>
-                  </button>
-                </div>
-              </div>
-
-              {/* RECENT TRANSACTIONS PREVIEW */}
-              <div className="pt-2">
-                <div className="flex items-center justify-between mb-3">
-                  <h3 className="text-xs font-bold text-gray-500 uppercase tracking-wider">
-                    Recent Activity
-                  </h3>
-                  {transactions.length > 0 && (
+                  <div className="flex items-center gap-2">
                     <button
-                      onClick={() => setActivePage('history')}
-                      className="text-xs font-bold text-[#0a5c36] hover:underline"
+                      type="button"
+                      onClick={() => handleCopyAccountNumber(currentUser.referralCode || 'EHUB-BEN492')}
+                      className="px-4 py-2 rounded-xl bg-[#0FA958] hover:bg-[#0c8f49] text-white font-heading font-sora font-extrabold text-xs transition cursor-pointer flex items-center gap-1.5"
                     >
-                      View All &amp; Filter
+                      {copiedAccount ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                      <span>{copiedAccount ? 'Copied!' : 'Copy Code'}</span>
                     </button>
-                  )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const shareUrl = `${window.location.origin}?ref=${encodeURIComponent(currentUser.referralCode || 'EHUB-BEN492')}`;
+                        const shareText = `Join eHUB VTU with my code ${currentUser.referralCode || 'EHUB-BEN492'} to get cheap data & airtime rebates! ${shareUrl}`;
+                        window.open(`https://api.whatsapp.com/send?text=${encodeURIComponent(shareText)}`, '_blank');
+                      }}
+                      className="px-4 py-2 rounded-xl bg-gray-100 dark:bg-green-900/50 hover:bg-gray-200 text-gray-800 dark:text-lime-300 font-bold text-xs transition cursor-pointer"
+                    >
+                      Share on WhatsApp
+                    </button>
+                  </div>
+                </div>
+              </section>
+
+              {/* ==================================================== */}
+              {/* UTILITY SERVICES: AEDC ELECTRICITY & CABLE TV        */}
+              {/* ==================================================== */}
+              <section className="bg-white dark:bg-[#0e2116] rounded-[24px] shadow-soft p-6 sm:p-8 space-y-6 border border-white/60 dark:border-green-900/40 transition-colors">
+                <div className="flex items-center justify-between pb-2 border-b border-gray-100 dark:border-green-900/40">
+                  <div>
+                    <h3 className="font-heading font-sora font-extrabold text-xl text-gray-900 dark:text-white">
+                      AEDC Electricity &amp; Utility Bills
+                    </h3>
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+                      Abuja Electricity Distribution Company (AEDC) &amp; TV Subscriptions
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActivePage('electricity')}
+                    className="text-xs font-heading font-sora font-extrabold text-[#0FA958] hover:underline"
+                  >
+                    Open Full Form →
+                  </button>
                 </div>
 
-                {transactions.length === 0 ? (
-                  <div className="p-6 rounded-2xl bg-gray-50 border border-dashed border-gray-200 text-center text-gray-500 text-xs">
-                    <Clock className="w-6 h-6 mx-auto mb-2 text-gray-400" />
-                    <span>No transactions yet. Buy data, airtime or pay bills above!</span>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    {transactions.slice(0, 3).map((tx) => (
-                      <div
-                        key={tx.transactionId}
-                        onClick={() => setSuccessReceipt(tx)}
-                        className="p-3 rounded-2xl bg-gray-50 hover:bg-gray-100 border border-gray-100 flex items-center justify-between transition cursor-pointer"
-                      >
-                        <div className="flex items-center gap-3">
-                          <div
-                            className={`w-9 h-9 rounded-xl flex items-center justify-center text-sm font-bold ${
-                              tx.type === 'data'
-                                ? 'bg-green-100 text-green-700'
-                                : tx.type === 'airtime'
-                                ? 'bg-blue-100 text-blue-700'
-                                : tx.type === 'electricity'
-                                ? 'bg-orange-100 text-orange-700'
-                                : tx.type === 'cable'
-                                ? 'bg-purple-100 text-purple-700'
-                                : 'bg-lime-200 text-[#0a5c36]'
-                            }`}
-                          >
-                            {tx.type === 'data' && <i className="fa-solid fa-signal"></i>}
-                            {tx.type === 'airtime' && <i className="fa-solid fa-phone"></i>}
-                            {tx.type === 'electricity' && <i className="fa-solid fa-lightbulb"></i>}
-                            {tx.type === 'cable' && <i className="fa-solid fa-tv"></i>}
-                            {tx.type === 'funding' && <Wallet className="w-4 h-4" />}
-                          </div>
-                          <div>
-                            <span className="text-xs font-bold text-gray-800 block truncate max-w-[180px]">
-                              {tx.title}
-                            </span>
-                            <span className="text-[10px] text-gray-400 block font-mono">
-                              {formatTxDisplayDate(tx.createdAt)}
-                            </span>
-                          </div>
-                        </div>
-                        <div className="text-right">
-                          <span
-                            className={`text-xs font-black block ${
-                              tx.type === 'funding' ? 'text-green-600' : 'text-gray-900'
-                            }`}
-                          >
-                            {tx.type === 'funding' ? '+' : '-'}₦{tx.amount.toLocaleString()}
-                          </span>
-                          <span className="text-[10px] text-green-600 font-semibold uppercase">
-                            Successful
-                          </span>
-                        </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {/* Electricity Card */}
+                  <div
+                    onClick={() => setActivePage('electricity')}
+                    className="p-5 rounded-2xl bg-gray-50 dark:bg-[#12241b] border border-gray-200 dark:border-green-900/40 hover:border-[#0FA958] transition cursor-pointer space-y-3"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-xl bg-amber-100 dark:bg-amber-950 text-amber-600 flex items-center justify-center font-bold">
+                        <i className="fa-solid fa-lightbulb text-lg"></i>
                       </div>
-                    ))}
+                      <div>
+                        <span className="font-heading font-sora font-extrabold text-sm text-gray-900 dark:text-white block">
+                          AEDC Electricity Token
+                        </span>
+                        <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                          Prepaid Token &amp; Postpaid Bill Verification
+                        </span>
+                      </div>
+                    </div>
+                    <span className="inline-block text-[11px] font-bold text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/60 px-2.5 py-1 rounded-full">
+                      Live Meter Verification Active
+                    </span>
                   </div>
-                )}
-              </div>
+
+                  {/* Dedicated Virtual Account */}
+                  <div
+                    onClick={() => {
+                      setFundMethod('bank_transfer');
+                      setIsFundModalOpen(true);
+                    }}
+                    className="p-5 rounded-2xl bg-gray-50 dark:bg-[#12241b] border border-gray-200 dark:border-green-900/40 hover:border-[#0FA958] transition cursor-pointer space-y-3"
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-xl bg-green-100 dark:bg-green-950 text-[#0FA958] flex items-center justify-center font-bold">
+                        <Building2 className="w-5 h-5" />
+                      </div>
+                      <div>
+                        <span className="font-heading font-sora font-extrabold text-sm text-gray-900 dark:text-white block">
+                          Moniepoint Automated Transfer
+                        </span>
+                        <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                          Acc: 8109283719 • Auto-credits wallet
+                        </span>
+                      </div>
+                    </div>
+                    <span className="inline-block text-[11px] font-bold text-[#0FA958] bg-[#e7f7ed] dark:bg-green-950 px-2.5 py-1 rounded-full">
+                      Zero Funding Fee
+                    </span>
+                  </div>
+                </div>
+              </section>
             </div>
           )}
 
@@ -1440,18 +2688,18 @@ export default function App() {
                     setActivePage('dashboard');
                     setActionError('');
                   }}
-                  className="p-2 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 transition cursor-pointer"
+                  className="p-2 rounded-xl bg-gray-100 dark:bg-[#162a20] hover:bg-gray-200 dark:hover:bg-[#1e382b] text-gray-700 dark:text-gray-200 transition cursor-pointer"
                 >
                   <ArrowLeft className="w-5 h-5" />
                 </button>
                 <div>
-                  <h2 className="text-lg font-black text-[#0a5c36]">Buy Mobile Data</h2>
-                  <span className="text-[11px] text-gray-500">Abuja's Cheapest SME &amp; Direct Data</span>
+                  <h2 className="text-lg font-black text-[#0a5c36] dark:text-[#d6ff00]">Buy Mobile Data</h2>
+                  <span className="text-[11px] text-gray-500 dark:text-gray-400">Abuja's Cheapest SME &amp; Direct Data</span>
                 </div>
               </div>
 
               {actionError && (
-                <div className="p-3 rounded-2xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-start gap-2">
+                <div className="p-3 rounded-2xl bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-900/60 text-red-700 dark:text-red-300 text-xs flex items-start gap-2">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                   <span>{actionError}</span>
                 </div>
@@ -1459,7 +2707,7 @@ export default function App() {
 
               {/* Network Selector */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-2">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-2">
                   1. Select Network
                 </label>
                 <div className="grid grid-cols-4 gap-2">
@@ -1477,14 +2725,14 @@ export default function App() {
                         }}
                         className={`py-3 px-2 rounded-2xl border flex flex-col items-center justify-center transition cursor-pointer ${
                           isSelected
-                            ? 'border-[#0a5c36] bg-[#0a5c36] text-white shadow-md'
-                            : 'border-gray-200 bg-gray-50 text-gray-700 hover:bg-white'
+                            ? 'border-[#0a5c36] dark:border-green-600 bg-[#0a5c36] dark:bg-green-700 text-white shadow-md'
+                            : 'border-gray-200 dark:border-green-900/50 bg-gray-50 dark:bg-[#12241b] text-gray-700 dark:text-gray-200 hover:bg-white dark:hover:bg-[#162c21]'
                         }`}
                       >
                         <span className="font-extrabold text-xs">{net}</span>
                         <span
                           className={`text-[9px] mt-0.5 font-semibold ${
-                            isSelected ? 'text-[#d6ff00]' : 'text-gray-400'
+                            isSelected ? 'text-[#d6ff00]' : 'text-gray-400 dark:text-gray-400'
                           }`}
                         >
                           {net === 'MTN'
@@ -1503,16 +2751,16 @@ export default function App() {
 
               {/* Plan Dropdown */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   2. Choose Data Plan
                 </label>
                 <select
                   value={selectedDataPlanId}
                   onChange={(e) => setSelectedDataPlanId(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 bg-white font-medium text-sm focus:outline-none focus:ring-2 focus:ring-[#0a5c36]"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white font-medium text-sm focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600"
                 >
                   {(DATA_PLANS[selectedNetwork] || []).map((plan) => (
-                    <option key={plan.id} value={plan.id}>
+                    <option key={plan.id} value={plan.id} className="dark:bg-[#0c1912] dark:text-white">
                       {plan.name} - ₦{plan.price.toLocaleString()} ({plan.validity})
                     </option>
                   ))}
@@ -1521,7 +2769,7 @@ export default function App() {
 
               {/* Phone Input */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   3. Recipient Phone Number
                 </label>
                 <div className="relative">
@@ -1530,7 +2778,7 @@ export default function App() {
                     placeholder="e.g. 08031234567"
                     value={dataPhone}
                     onChange={(e) => setDataPhone(e.target.value)}
-                    className="w-full px-4 py-3 pl-10 rounded-2xl border border-gray-300 font-medium text-sm focus:outline-none focus:ring-2 focus:ring-[#0a5c36]"
+                    className="w-full px-4 py-3 pl-10 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 font-medium text-sm focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600"
                   />
                   <Phone className="w-4 h-4 text-gray-400 absolute left-3.5 top-3.5" />
                 </div>
@@ -1538,7 +2786,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={() => setDataPhone('08030001234')}
-                    className="text-[10px] text-[#0a5c36] bg-green-50 px-2 py-0.5 rounded-md font-bold cursor-pointer"
+                    className="text-[10px] text-[#0a5c36] dark:text-lime-300 bg-green-50 dark:bg-green-950/80 px-2 py-0.5 rounded-md font-bold cursor-pointer border border-transparent dark:border-green-800/40"
                   >
                     + Use Sample No
                   </button>
@@ -1550,18 +2798,18 @@ export default function App() {
                 const plan = (DATA_PLANS[selectedNetwork] || []).find((p) => p.id === selectedDataPlanId);
                 if (!plan) return null;
                 return (
-                  <div className="p-4 rounded-2xl bg-green-50/80 border border-green-200 text-xs space-y-1.5">
-                    <div className="flex justify-between text-gray-600">
+                  <div className="p-4 rounded-2xl bg-green-50/80 dark:bg-[#11261b] border border-green-200 dark:border-green-800/60 text-xs space-y-1.5">
+                    <div className="flex justify-between text-gray-600 dark:text-gray-300">
                       <span>Network &amp; Bundle:</span>
-                      <strong className="text-gray-900">{plan.name}</strong>
+                      <strong className="text-gray-900 dark:text-white">{plan.name}</strong>
                     </div>
-                    <div className="flex justify-between text-gray-600">
+                    <div className="flex justify-between text-gray-600 dark:text-gray-300">
                       <span>Validity:</span>
-                      <strong className="text-gray-900">{plan.validity}</strong>
+                      <strong className="text-gray-900 dark:text-white">{plan.validity}</strong>
                     </div>
-                    <div className="flex justify-between text-gray-600 pt-1 border-t border-green-200 font-bold">
-                      <span className="text-[#0a5c36]">Total Price:</span>
-                      <span className="text-[#0a5c36] text-base font-black">
+                    <div className="flex justify-between text-gray-600 dark:text-gray-300 pt-1 border-t border-green-200 dark:border-green-800/60 font-bold">
+                      <span className="text-[#0a5c36] dark:text-[#d6ff00]">Total Price:</span>
+                      <span className="text-[#0a5c36] dark:text-[#d6ff00] text-base font-black">
                         ₦{plan.price.toLocaleString()}
                       </span>
                     </div>
@@ -1572,7 +2820,7 @@ export default function App() {
               <button
                 onClick={buyData}
                 disabled={actionLoading}
-                className="w-full py-4 bg-[#0a5c36] hover:bg-[#084b2c] text-white font-black rounded-2xl shadow-lg shadow-green-900/10 active:scale-[0.99] transition text-sm flex items-center justify-center gap-2 cursor-pointer"
+                className="w-full py-4 bg-[#0a5c36] hover:bg-[#084b2c] dark:bg-green-700 dark:hover:bg-green-600 text-white font-black rounded-2xl shadow-lg shadow-green-900/10 active:scale-[0.99] transition text-sm flex items-center justify-center gap-2 cursor-pointer"
               >
                 {actionLoading ? (
                   <>
@@ -1588,7 +2836,7 @@ export default function App() {
               </button>
 
               <div className="text-center">
-                <span className="text-[10px] text-gray-400">
+                <span className="text-[10px] text-gray-400 dark:text-gray-500">
                   Direct API Gateway: https://www.nellobytesystems.com/APIDatabundleV1.asp
                 </span>
               </div>
@@ -1606,18 +2854,18 @@ export default function App() {
                     setActivePage('dashboard');
                     setActionError('');
                   }}
-                  className="p-2 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 transition cursor-pointer"
+                  className="p-2 rounded-xl bg-gray-100 dark:bg-[#162a20] hover:bg-gray-200 dark:hover:bg-[#1e382b] text-gray-700 dark:text-gray-200 transition cursor-pointer"
                 >
                   <ArrowLeft className="w-5 h-5" />
                 </button>
                 <div>
-                  <h2 className="text-lg font-black text-blue-700">Buy Airtime (2% OFF)</h2>
-                  <span className="text-[11px] text-gray-500">Instant Automated VTU Recharge</span>
+                  <h2 className="text-lg font-black text-blue-700 dark:text-blue-400">Buy Airtime (2% OFF)</h2>
+                  <span className="text-[11px] text-gray-500 dark:text-gray-400">Instant Automated VTU Recharge</span>
                 </div>
               </div>
 
               {actionError && (
-                <div className="p-3 rounded-2xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-start gap-2">
+                <div className="p-3 rounded-2xl bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-900/60 text-red-700 dark:text-red-300 text-xs flex items-start gap-2">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                   <span>{actionError}</span>
                 </div>
@@ -1625,7 +2873,7 @@ export default function App() {
 
               {/* Network */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-2">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-2">
                   1. Network
                 </label>
                 <div className="grid grid-cols-4 gap-2">
@@ -1638,7 +2886,7 @@ export default function App() {
                         className={`py-3 px-2 rounded-2xl border font-bold text-xs flex items-center justify-center transition cursor-pointer ${
                           isSelected
                             ? 'border-blue-600 bg-blue-600 text-white shadow-md'
-                            : 'border-gray-200 bg-gray-50 text-gray-700 hover:bg-white'
+                            : 'border-gray-200 dark:border-blue-900/40 bg-gray-50 dark:bg-[#12241b] text-gray-700 dark:text-gray-200 hover:bg-white dark:hover:bg-[#162c21]'
                         }`}
                       >
                         {net}
@@ -1650,7 +2898,7 @@ export default function App() {
 
               {/* Phone */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   2. Phone Number
                 </label>
                 <div className="relative">
@@ -1659,7 +2907,7 @@ export default function App() {
                     placeholder="e.g. 08023456789"
                     value={airtimePhone}
                     onChange={(e) => setAirtimePhone(e.target.value)}
-                    className="w-full px-4 py-3 pl-10 rounded-2xl border border-gray-300 font-medium text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
+                    className="w-full px-4 py-3 pl-10 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 font-medium text-sm focus:outline-none focus:ring-2 focus:ring-blue-600"
                   />
                   <Phone className="w-4 h-4 text-gray-400 absolute left-3.5 top-3.5" />
                 </div>
@@ -1667,7 +2915,7 @@ export default function App() {
 
               {/* Amount */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   3. Amount (₦)
                 </label>
                 <input
@@ -1676,7 +2924,7 @@ export default function App() {
                   step={50}
                   value={airtimeAmount}
                   onChange={(e) => setAirtimeAmount(Number(e.target.value))}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 font-bold text-base focus:outline-none focus:ring-2 focus:ring-blue-600"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white font-bold text-base focus:outline-none focus:ring-2 focus:ring-blue-600"
                 />
                 <div className="flex flex-wrap gap-2 mt-2">
                   {[100, 200, 500, 1000, 2000].map((amt) => (
@@ -1686,8 +2934,8 @@ export default function App() {
                       onClick={() => setAirtimeAmount(amt)}
                       className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition cursor-pointer ${
                         airtimeAmount === amt
-                          ? 'bg-blue-100 border-blue-400 text-blue-700'
-                          : 'bg-gray-50 border-gray-200 text-gray-600 hover:bg-gray-100'
+                          ? 'bg-blue-100 dark:bg-blue-900/80 border-blue-400 dark:border-blue-500 text-blue-700 dark:text-blue-200'
+                          : 'bg-gray-50 dark:bg-[#12241b] border-gray-200 dark:border-green-900/50 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#183024]'
                       }`}
                     >
                       ₦{amt}
@@ -1697,18 +2945,18 @@ export default function App() {
               </div>
 
               {/* Discount Box */}
-              <div className="p-4 rounded-2xl bg-blue-50 border border-blue-200 text-xs space-y-1.5">
-                <div className="flex justify-between text-gray-600">
+              <div className="p-4 rounded-2xl bg-blue-50 dark:bg-[#0f1d2b] border border-blue-200 dark:border-blue-900/50 text-xs space-y-1.5">
+                <div className="flex justify-between text-gray-600 dark:text-gray-300">
                   <span>Recharge Value:</span>
                   <span className="font-bold line-through text-gray-400">₦{airtimeAmount}</span>
                 </div>
-                <div className="flex justify-between text-blue-700 font-semibold">
+                <div className="flex justify-between text-blue-700 dark:text-blue-300 font-semibold">
                   <span>eHUB 2% Discount:</span>
                   <span>- ₦{Math.round(airtimeAmount * 0.02)}</span>
                 </div>
-                <div className="flex justify-between text-gray-900 pt-1 border-t border-blue-200 font-bold">
+                <div className="flex justify-between text-gray-900 dark:text-white pt-1 border-t border-blue-200 dark:border-blue-900/50 font-bold">
                   <span>Amount to Pay:</span>
-                  <span className="text-blue-700 text-base font-black">
+                  <span className="text-blue-700 dark:text-blue-400 text-base font-black">
                     ₦{Math.round(airtimeAmount * 0.98).toLocaleString()}
                   </span>
                 </div>
@@ -1745,18 +2993,18 @@ export default function App() {
                     setActivePage('dashboard');
                     setActionError('');
                   }}
-                  className="p-2 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 transition cursor-pointer"
+                  className="p-2 rounded-xl bg-gray-100 dark:bg-[#162a20] hover:bg-gray-200 dark:hover:bg-[#1e382b] text-gray-700 dark:text-gray-200 transition cursor-pointer"
                 >
                   <ArrowLeft className="w-5 h-5" />
                 </button>
                 <div>
-                  <h2 className="text-lg font-black text-amber-700">Electricity Bill Payment</h2>
-                  <span className="text-[11px] text-gray-500">AEDC Abuja &amp; All Nigerian Discos</span>
+                  <h2 className="text-lg font-black text-amber-700 dark:text-amber-400">Electricity Bill Payment</h2>
+                  <span className="text-[11px] text-gray-500 dark:text-gray-400">AEDC Abuja &amp; All Nigerian Discos</span>
                 </div>
               </div>
 
               {actionError && (
-                <div className="p-3 rounded-2xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-start gap-2">
+                <div className="p-3 rounded-2xl bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-900/60 text-red-700 dark:text-red-300 text-xs flex items-start gap-2">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                   <span>{actionError}</span>
                 </div>
@@ -1764,16 +3012,21 @@ export default function App() {
 
               {/* Disco */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   1. Distribution Company (Disco)
                 </label>
                 <select
                   value={selectedDisco}
-                  onChange={(e) => setSelectedDisco(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 bg-white font-bold text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  onChange={(e) => {
+                    setSelectedDisco(e.target.value);
+                    setVerifiedCustomerName('');
+                    setMeterVerified(false);
+                    setMeterVerificationError('');
+                  }}
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white font-bold text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
                 >
                   {DISCO_PROVIDERS.map((d) => (
-                    <option key={d.id} value={d.id}>
+                    <option key={d.id} value={d.id} className="dark:bg-[#0c1912] dark:text-white">
                       {d.name} {d.featured ? '⭐ (Abuja)' : ''}
                     </option>
                   ))}
@@ -1782,28 +3035,38 @@ export default function App() {
 
               {/* Meter Type */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   2. Meter Type
                 </label>
                 <div className="grid grid-cols-2 gap-2">
                   <button
                     type="button"
-                    onClick={() => setMeterType('prepaid')}
+                    onClick={() => {
+                      setMeterType('prepaid');
+                      setVerifiedCustomerName('');
+                      setMeterVerified(false);
+                      setMeterVerificationError('');
+                    }}
                     className={`py-2.5 rounded-xl font-bold text-xs border transition cursor-pointer ${
                       meterType === 'prepaid'
                         ? 'bg-amber-600 border-amber-600 text-white shadow-sm'
-                        : 'bg-gray-50 border-gray-200 text-gray-700'
+                        : 'bg-gray-50 dark:bg-[#12241b] border-gray-200 dark:border-green-900/50 text-gray-700 dark:text-gray-200'
                     }`}
                   >
                     PREPAID (Generates Token)
                   </button>
                   <button
                     type="button"
-                    onClick={() => setMeterType('postpaid')}
+                    onClick={() => {
+                      setMeterType('postpaid');
+                      setVerifiedCustomerName('');
+                      setMeterVerified(false);
+                      setMeterVerificationError('');
+                    }}
                     className={`py-2.5 rounded-xl font-bold text-xs border transition cursor-pointer ${
                       meterType === 'postpaid'
                         ? 'bg-amber-600 border-amber-600 text-white shadow-sm'
-                        : 'bg-gray-50 border-gray-200 text-gray-700'
+                        : 'bg-gray-50 dark:bg-[#12241b] border-gray-200 dark:border-green-900/50 text-gray-700 dark:text-gray-200'
                     }`}
                   >
                     POSTPAID (Bill Credit)
@@ -1811,42 +3074,75 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Meter Number */}
+              {/* Meter Number with VERIFY button before Amount */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   3. Meter Number
                 </label>
-                <input
-                  type="text"
-                  placeholder="e.g. 44001928371"
-                  value={meterNumber}
-                  onChange={(e) => {
-                    setMeterNumber(e.target.value);
-                    if (e.target.value.length >= 8) {
-                      setVerifiedCustomerName('MUSA BELLO - Gwarinpa Phase 2, Abuja');
-                    } else {
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    placeholder="Enter Meter Number"
+                    value={meterNumber}
+                    onChange={(e) => {
+                      setMeterNumber(e.target.value);
                       setVerifiedCustomerName('');
-                    }
-                  }}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
-                />
-                {verifiedCustomerName ? (
-                  <div className="mt-1.5 p-2 rounded-xl bg-green-50 border border-green-200 text-green-800 text-[11px] flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3.5 h-3.5 text-green-600 shrink-0" />
-                    <span>
-                      <strong>Customer:</strong> {verifiedCustomerName}
+                      setMeterVerified(false);
+                      setMeterVerificationError('');
+                    }}
+                    className="flex-1 px-4 py-3 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleVerifyMeter}
+                    disabled={isVerifyingMeter || !meterNumber.trim()}
+                    className="px-5 py-3 rounded-2xl bg-amber-600 hover:bg-amber-700 disabled:bg-gray-300 dark:disabled:bg-gray-800 text-white font-black text-xs shadow-sm transition active:scale-95 flex items-center justify-center gap-1.5 shrink-0 cursor-pointer disabled:cursor-not-allowed"
+                  >
+                    {isVerifyingMeter ? (
+                      <>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        <span>Verifying...</span>
+                      </>
+                    ) : (
+                      <span>VERIFY</span>
+                    )}
+                  </button>
+                </div>
+
+                {/* Error message if verification fails or meter does not match */}
+                {meterVerificationError && (
+                  <div className="mt-2.5 p-3 rounded-xl bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-900/60 text-red-700 dark:text-red-300 text-xs font-bold flex items-center gap-2 animate-in fade-in">
+                    <AlertCircle className="w-4 h-4 shrink-0 text-red-600 dark:text-red-400" />
+                    <span>{meterVerificationError}</span>
+                  </div>
+                )}
+
+                {/* Customer name ONLY shown when verification returns success */}
+                {meterVerified && verifiedCustomerName && (
+                  <div className="mt-2.5 p-3.5 rounded-2xl bg-green-50 dark:bg-[#11291b] border border-green-200 dark:border-green-800/80 text-green-950 dark:text-green-100 text-xs flex items-center justify-between animate-in fade-in">
+                    <div className="flex items-center gap-2.5">
+                      <div className="w-7 h-7 rounded-full bg-green-200 dark:bg-green-800 text-green-800 dark:text-green-200 flex items-center justify-center">
+                        <CheckCircle2 className="w-4 h-4 text-green-700 dark:text-lime-300" />
+                      </div>
+                      <div>
+                        <span className="text-[10px] text-green-700 dark:text-green-400 font-bold uppercase tracking-wider block">
+                          Verified Customer Name
+                        </span>
+                        <strong className="text-sm font-black text-green-950 dark:text-white block">
+                          {verifiedCustomerName}
+                        </strong>
+                      </div>
+                    </div>
+                    <span className="px-2.5 py-1 rounded-full bg-green-200 dark:bg-green-800 text-green-800 dark:text-lime-300 text-[10px] font-black uppercase tracking-wider">
+                      VERIFIED
                     </span>
                   </div>
-                ) : (
-                  <span className="text-[10px] text-gray-400 block mt-1">
-                    AEDC Meter verification is active.
-                  </span>
                 )}
               </div>
 
               {/* Amount */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   4. Amount to Pay (₦)
                 </label>
                 <input
@@ -1855,7 +3151,7 @@ export default function App() {
                   step={500}
                   value={electricityAmount}
                   onChange={(e) => setElectricityAmount(Number(e.target.value))}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 font-bold text-base focus:outline-none focus:ring-2 focus:ring-amber-500"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white font-bold text-base focus:outline-none focus:ring-2 focus:ring-amber-500"
                 />
                 <div className="flex flex-wrap gap-2 mt-2">
                   {[1000, 2000, 3000, 5000, 10000].map((amt) => (
@@ -1865,8 +3161,8 @@ export default function App() {
                       onClick={() => setElectricityAmount(amt)}
                       className={`px-3 py-1.5 rounded-xl text-xs font-bold border transition cursor-pointer ${
                         electricityAmount === amt
-                          ? 'bg-amber-100 border-amber-400 text-amber-800'
-                          : 'bg-gray-50 border-gray-200 text-gray-600 hover:bg-gray-100'
+                          ? 'bg-amber-100 dark:bg-amber-900/80 border-amber-400 dark:border-amber-600 text-amber-800 dark:text-amber-200'
+                          : 'bg-gray-50 dark:bg-[#12241b] border-gray-200 dark:border-green-900/50 text-gray-600 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-[#183024]'
                       }`}
                     >
                       ₦{amt.toLocaleString()}
@@ -1906,18 +3202,18 @@ export default function App() {
                     setActivePage('dashboard');
                     setActionError('');
                   }}
-                  className="p-2 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 transition cursor-pointer"
+                  className="p-2 rounded-xl bg-gray-100 dark:bg-[#162a20] hover:bg-gray-200 dark:hover:bg-[#1e382b] text-gray-700 dark:text-gray-200 transition cursor-pointer"
                 >
                   <ArrowLeft className="w-5 h-5" />
                 </button>
                 <div>
-                  <h2 className="text-lg font-black text-purple-700">Cable TV Subscription</h2>
-                  <span className="text-[11px] text-gray-500">GOTV, DSTV &amp; Startimes Instant Activation</span>
+                  <h2 className="text-lg font-black text-purple-700 dark:text-purple-400">Cable TV Subscription</h2>
+                  <span className="text-[11px] text-gray-500 dark:text-gray-400">GOTV, DSTV &amp; Startimes Instant Activation</span>
                 </div>
               </div>
 
               {actionError && (
-                <div className="p-3 rounded-2xl bg-red-50 border border-red-200 text-red-700 text-xs flex items-start gap-2">
+                <div className="p-3 rounded-2xl bg-red-50 dark:bg-red-950/60 border border-red-200 dark:border-red-900/60 text-red-700 dark:text-red-300 text-xs flex items-start gap-2">
                   <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
                   <span>{actionError}</span>
                 </div>
@@ -1925,7 +3221,7 @@ export default function App() {
 
               {/* Provider */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-2">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-2">
                   1. Provider
                 </label>
                 <div className="grid grid-cols-3 gap-2">
@@ -1944,7 +3240,7 @@ export default function App() {
                         className={`py-3 px-2 rounded-2xl border font-black text-xs flex items-center justify-center transition cursor-pointer ${
                           isSelected
                             ? 'border-purple-600 bg-purple-600 text-white shadow-md'
-                            : 'border-gray-200 bg-gray-50 text-gray-700 hover:bg-white'
+                            : 'border-gray-200 dark:border-purple-900/40 bg-gray-50 dark:bg-[#12241b] text-gray-700 dark:text-gray-200 hover:bg-white dark:hover:bg-[#162c21]'
                         }`}
                       >
                         {prov}
@@ -1956,16 +3252,16 @@ export default function App() {
 
               {/* Package dropdown */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   2. Select Bouquet / Package
                 </label>
                 <select
                   value={selectedCablePackageId}
                   onChange={(e) => setSelectedCablePackageId(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 bg-white font-medium text-sm focus:outline-none focus:ring-2 focus:ring-purple-600"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white font-medium text-sm focus:outline-none focus:ring-2 focus:ring-purple-600"
                 >
                   {(CABLE_PACKAGES[cableProvider] || []).map((pkg) => (
-                    <option key={pkg.id} value={pkg.id}>
+                    <option key={pkg.id} value={pkg.id} className="dark:bg-[#0c1912] dark:text-white">
                       {pkg.name} - ₦{pkg.price.toLocaleString()}
                     </option>
                   ))}
@@ -1974,7 +3270,7 @@ export default function App() {
 
               {/* IUC */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   3. IUC / Smartcard Number
                 </label>
                 <input
@@ -1982,13 +3278,13 @@ export default function App() {
                   placeholder="e.g. 2039485710"
                   value={iucNumber}
                   onChange={(e) => setIucNumber(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-purple-600"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-purple-600"
                 />
               </div>
 
               {/* Phone number */}
               <div>
-                <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                   4. Registered Phone Number
                 </label>
                 <input
@@ -1996,7 +3292,7 @@ export default function App() {
                   placeholder="e.g. 08031234567"
                   value={cablePhone}
                   onChange={(e) => setCablePhone(e.target.value)}
-                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 font-medium text-sm focus:outline-none focus:ring-2 focus:ring-purple-600"
+                  className="w-full px-4 py-3 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 font-medium text-sm focus:outline-none focus:ring-2 focus:ring-purple-600"
                 />
               </div>
 
@@ -2036,13 +3332,13 @@ export default function App() {
                 <div className="flex items-center gap-2">
                   <button
                     onClick={() => setActivePage('dashboard')}
-                    className="p-2 rounded-xl bg-gray-100 hover:bg-gray-200 text-gray-700 transition cursor-pointer"
+                    className="p-2 rounded-xl bg-gray-100 dark:bg-[#162a20] hover:bg-gray-200 dark:hover:bg-[#1e382b] text-gray-700 dark:text-gray-200 transition cursor-pointer"
                   >
                     <ArrowLeft className="w-5 h-5" />
                   </button>
                   <div>
-                    <h2 className="text-lg font-black text-gray-800">Transaction History</h2>
-                    <span className="text-[11px] text-gray-500">
+                    <h2 className="text-lg font-black text-gray-800 dark:text-white">Transaction History</h2>
+                    <span className="text-[11px] text-gray-500 dark:text-gray-400">
                       Showing {filteredTransactions.length} of {transactions.length} records
                     </span>
                   </div>
@@ -2052,8 +3348,8 @@ export default function App() {
                   onClick={() => setIsFilterExpanded(!isFilterExpanded)}
                   className={`flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition cursor-pointer ${
                     hasActiveFilters || isFilterExpanded
-                      ? 'bg-[#0a5c36] text-white border-[#0a5c36]'
-                      : 'bg-gray-100 text-gray-700 border-gray-200'
+                      ? 'bg-[#0a5c36] text-white border-[#0a5c36] dark:bg-green-700 dark:border-green-600'
+                      : 'bg-gray-100 dark:bg-[#162a20] text-gray-700 dark:text-gray-200 border-gray-200 dark:border-green-900/50'
                   }`}
                 >
                   <SlidersHorizontal className="w-3.5 h-3.5" />
@@ -2063,21 +3359,21 @@ export default function App() {
 
               {/* FINANCIAL SUMMARY CARDS */}
               <div className="grid grid-cols-2 gap-2.5">
-                <div className="p-3 rounded-2xl bg-emerald-50 border border-emerald-200/80">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800 flex items-center gap-1">
-                    <TrendingUp className="w-3.5 h-3.5 text-emerald-600" />
+                <div className="p-3 rounded-2xl bg-emerald-50 dark:bg-[#0f241a] border border-emerald-200/80 dark:border-emerald-800/60">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-800 dark:text-emerald-300 flex items-center gap-1">
+                    <TrendingUp className="w-3.5 h-3.5 text-emerald-600 dark:text-emerald-400" />
                     Total Funded
                   </span>
-                  <span className="text-base font-black text-emerald-700 block mt-0.5">
+                  <span className="text-base font-black text-emerald-700 dark:text-emerald-400 block mt-0.5">
                     +₦{totalFilteredFunded.toLocaleString()}
                   </span>
                 </div>
-                <div className="p-3 rounded-2xl bg-rose-50 border border-rose-200/80">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-rose-800 flex items-center gap-1">
-                    <TrendingDown className="w-3.5 h-3.5 text-rose-600" />
+                <div className="p-3 rounded-2xl bg-rose-50 dark:bg-[#261216] border border-rose-200/80 dark:border-rose-900/60">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-rose-800 dark:text-rose-300 flex items-center gap-1">
+                    <TrendingDown className="w-3.5 h-3.5 text-rose-600 dark:text-rose-400" />
                     Total Spent
                   </span>
-                  <span className="text-base font-black text-rose-700 block mt-0.5">
+                  <span className="text-base font-black text-rose-700 dark:text-rose-400 block mt-0.5">
                     -₦{totalFilteredSpent.toLocaleString()}
                   </span>
                 </div>
@@ -2085,10 +3381,10 @@ export default function App() {
 
               {/* FILTER CONTROLS DRAWER / PANEL */}
               {isFilterExpanded && (
-                <div className="p-4 rounded-[22px] bg-gray-50 border border-gray-200 space-y-3.5 animate-in fade-in">
+                <div className="p-4 rounded-[22px] bg-gray-50 dark:bg-[#0c1912] border border-gray-200 dark:border-green-900/40 space-y-3.5 animate-in fade-in">
                   {/* Search Query */}
                   <div>
-                    <label className="block text-[11px] font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+                    <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
                       Search Transactions
                     </label>
                     <div className="relative">
@@ -2097,13 +3393,13 @@ export default function App() {
                         placeholder="Search reference, phone, plan, Disco..."
                         value={searchQuery}
                         onChange={(e) => setSearchQuery(e.target.value)}
-                        className="w-full px-3.5 py-2.5 pl-9 pr-8 rounded-xl border border-gray-200 bg-white text-xs focus:outline-none focus:ring-2 focus:ring-[#0a5c36]"
+                        className="w-full px-3.5 py-2.5 pl-9 pr-8 rounded-xl border border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#12241b] text-xs text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600"
                       />
                       <Search className="w-4 h-4 text-gray-400 absolute left-3 top-2.5" />
                       {searchQuery && (
                         <button
                           onClick={() => setSearchQuery('')}
-                          className="w-5 h-5 rounded-full bg-gray-200 text-gray-600 hover:bg-gray-300 flex items-center justify-center absolute right-2.5 top-2.5 text-[10px] cursor-pointer"
+                          className="w-5 h-5 rounded-full bg-gray-200 dark:bg-green-900 text-gray-600 dark:text-gray-200 hover:bg-gray-300 flex items-center justify-center absolute right-2.5 top-2.5 text-[10px] cursor-pointer"
                         >
                           ✕
                         </button>
@@ -2114,13 +3410,13 @@ export default function App() {
                   {/* 1. FILTER BY TYPE */}
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
-                      <label className="block text-[11px] font-bold text-gray-700 uppercase tracking-wider">
+                      <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                         Filter by Type
                       </label>
                       {filterType !== 'all' && (
                         <button
                           onClick={() => setFilterType('all')}
-                          className="text-[10px] text-[#0a5c36] font-bold hover:underline"
+                          className="text-[10px] text-[#0a5c36] dark:text-[#d6ff00] font-bold hover:underline"
                         >
                           Reset Type
                         </button>
@@ -2143,15 +3439,17 @@ export default function App() {
                             onClick={() => setFilterType(item.id)}
                             className={`px-3 py-1.5 rounded-xl text-xs font-bold flex items-center gap-1.5 border transition cursor-pointer ${
                               isSelected
-                                ? 'bg-[#0a5c36] text-white border-[#0a5c36] shadow-xs'
-                                : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-100'
+                                ? 'bg-[#0a5c36] text-white border-[#0a5c36] dark:bg-green-700 dark:border-green-600 shadow-xs'
+                                : 'bg-white dark:bg-[#12241b] text-gray-600 dark:text-gray-300 border-gray-200 dark:border-green-900/50 hover:bg-gray-100 dark:hover:bg-[#162c21]'
                             }`}
                           >
                             <i className={`fa-solid ${item.icon} text-[10px]`}></i>
                             <span>{item.label}</span>
                             <span
                               className={`text-[10px] px-1.5 py-0.2 rounded-full font-bold ${
-                                isSelected ? 'bg-white/20 text-[#d6ff00]' : 'bg-gray-100 text-gray-500'
+                                isSelected
+                                  ? 'bg-white/20 text-[#d6ff00]'
+                                  : 'bg-gray-100 dark:bg-[#1a3325] text-gray-500 dark:text-gray-400'
                               }`}
                             >
                               {count}
@@ -2165,7 +3463,7 @@ export default function App() {
                   {/* 2. FILTER BY DATE RANGE */}
                   <div>
                     <div className="flex items-center justify-between mb-1.5">
-                      <label className="block text-[11px] font-bold text-gray-700 uppercase tracking-wider">
+                      <label className="block text-[11px] font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                         Filter by Date Range
                       </label>
                       {dateRangePreset !== 'all' && (
@@ -2175,7 +3473,7 @@ export default function App() {
                             setCustomStartDate('');
                             setCustomEndDate('');
                           }}
-                          className="text-[10px] text-[#0a5c36] font-bold hover:underline"
+                          className="text-[10px] text-[#0a5c36] dark:text-[#d6ff00] font-bold hover:underline"
                         >
                           Reset Dates
                         </button>
@@ -2196,8 +3494,8 @@ export default function App() {
                             onClick={() => setDateRangePreset(item.id as any)}
                             className={`py-1.5 px-2 rounded-xl text-xs font-bold border transition text-center cursor-pointer ${
                               isSelected
-                                ? 'bg-[#0a5c36] text-white border-[#0a5c36] shadow-xs'
-                                : 'bg-white text-gray-600 border-gray-200 hover:bg-gray-100'
+                                ? 'bg-[#0a5c36] text-white border-[#0a5c36] dark:bg-green-700 dark:border-green-600 shadow-xs'
+                                : 'bg-white dark:bg-[#12241b] text-gray-600 dark:text-gray-300 border-gray-200 dark:border-green-900/50 hover:bg-gray-100 dark:hover:bg-[#162c21]'
                             }`}
                           >
                             {item.label}
@@ -2208,27 +3506,27 @@ export default function App() {
 
                     {/* Custom Date Picker Fields */}
                     {dateRangePreset === 'custom' && (
-                      <div className="mt-2.5 p-3 rounded-xl bg-white border border-gray-200 space-y-2">
-                        <span className="text-[10px] font-bold text-gray-500 uppercase tracking-wider block">
+                      <div className="mt-2.5 p-3 rounded-xl bg-white dark:bg-[#12241b] border border-gray-200 dark:border-green-900/50 space-y-2">
+                        <span className="text-[10px] font-bold text-gray-500 dark:text-gray-400 uppercase tracking-wider block">
                           Select Specific Start &amp; End Dates:
                         </span>
                         <div className="grid grid-cols-2 gap-2">
                           <div>
-                            <span className="text-[10px] text-gray-500 block mb-1">From:</span>
+                            <span className="text-[10px] text-gray-500 dark:text-gray-400 block mb-1">From:</span>
                             <input
                               type="date"
                               value={customStartDate}
                               onChange={(e) => setCustomStartDate(e.target.value)}
-                              className="w-full px-2 py-1.5 rounded-lg border border-gray-200 text-xs text-gray-700 focus:outline-none focus:ring-1 focus:ring-[#0a5c36]"
+                              className="w-full px-2 py-1.5 rounded-lg border border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#0c1912] text-xs text-gray-700 dark:text-gray-200 focus:outline-none focus:ring-1 focus:ring-[#0a5c36]"
                             />
                           </div>
                           <div>
-                            <span className="text-[10px] text-gray-500 block mb-1">To:</span>
+                            <span className="text-[10px] text-gray-500 dark:text-gray-400 block mb-1">To:</span>
                             <input
                               type="date"
                               value={customEndDate}
                               onChange={(e) => setCustomEndDate(e.target.value)}
-                              className="w-full px-2 py-1.5 rounded-lg border border-gray-200 text-xs text-gray-700 focus:outline-none focus:ring-1 focus:ring-[#0a5c36]"
+                              className="w-full px-2 py-1.5 rounded-lg border border-gray-200 dark:border-green-900/50 bg-white dark:bg-[#0c1912] text-xs text-gray-700 dark:text-gray-200 focus:outline-none focus:ring-1 focus:ring-[#0a5c36]"
                             />
                           </div>
                         </div>
@@ -2238,23 +3536,23 @@ export default function App() {
 
                   {/* ACTIVE FILTER TAGS & RESET ALL */}
                   {hasActiveFilters && (
-                    <div className="pt-2 border-t border-gray-200 flex items-center justify-between text-xs">
+                    <div className="pt-2 border-t border-gray-200 dark:border-green-900/40 flex items-center justify-between text-xs">
                       <div className="flex flex-wrap gap-1 items-center">
                         <span className="text-[10px] text-gray-400 font-bold uppercase">Active:</span>
                         {filterType !== 'all' && (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-green-100 text-[#0a5c36] text-[10px] font-bold">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-950 text-[#0a5c36] dark:text-lime-300 text-[10px] font-bold">
                             Type: {filterType}
                             <button onClick={() => setFilterType('all')} className="hover:text-red-700">✕</button>
                           </span>
                         )}
                         {dateRangePreset !== 'all' && (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-100 text-blue-700 text-[10px] font-bold">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300 text-[10px] font-bold">
                             Date: {dateRangePreset === 'custom' ? 'Custom' : dateRangePreset}
                             <button onClick={() => { setDateRangePreset('all'); setCustomStartDate(''); setCustomEndDate(''); }} className="hover:text-red-700">✕</button>
                           </span>
                         )}
                         {searchQuery && (
-                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 text-amber-800 text-[10px] font-bold">
+                          <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300 text-[10px] font-bold">
                             "{searchQuery.slice(0, 10)}"
                             <button onClick={() => setSearchQuery('')} className="hover:text-red-700">✕</button>
                           </span>
@@ -2263,7 +3561,7 @@ export default function App() {
 
                       <button
                         onClick={resetAllFilters}
-                        className="text-[11px] font-black text-red-600 hover:underline shrink-0 ml-2 cursor-pointer"
+                        className="text-[11px] font-black text-red-600 dark:text-red-400 hover:underline shrink-0 ml-2 cursor-pointer"
                       >
                         Reset All
                       </button>
@@ -2274,16 +3572,16 @@ export default function App() {
 
               {/* FILTERED TRANSACTIONS LIST */}
               {filteredTransactions.length === 0 ? (
-                <div className="py-12 px-4 rounded-2xl bg-gray-50 border border-dashed border-gray-200 text-center text-gray-500 text-xs space-y-2">
+                <div className="py-12 px-4 rounded-2xl bg-gray-50 dark:bg-[#0c1912] border border-dashed border-gray-200 dark:border-green-900/40 text-center text-gray-500 dark:text-gray-400 text-xs space-y-2">
                   <Filter className="w-8 h-8 mx-auto text-gray-400" />
-                  <p className="font-bold text-gray-700">No transactions match your criteria.</p>
+                  <p className="font-bold text-gray-700 dark:text-gray-200">No transactions match your criteria.</p>
                   <p className="text-[11px] text-gray-400 max-w-xs mx-auto">
                     Try picking a broader date range or changing your type filter.
                   </p>
                   {hasActiveFilters && (
                     <button
                       onClick={resetAllFilters}
-                      className="mt-2 px-4 py-2 bg-[#0a5c36] text-white rounded-xl text-xs font-bold shadow-xs hover:bg-[#074729] cursor-pointer"
+                      className="mt-2 px-4 py-2 bg-[#0a5c36] hover:bg-[#074729] dark:bg-green-700 dark:hover:bg-green-600 text-white rounded-xl text-xs font-bold shadow-xs cursor-pointer"
                     >
                       Clear All Filters
                     </button>
@@ -2295,20 +3593,20 @@ export default function App() {
                     <div
                       key={tx.transactionId}
                       onClick={() => setSuccessReceipt(tx)}
-                      className="p-3.5 rounded-2xl bg-white border border-gray-200 hover:border-[#0a5c36] shadow-xs flex items-center justify-between transition cursor-pointer"
+                      className="p-3.5 rounded-2xl bg-white dark:bg-[#12241b] border border-gray-200 dark:border-green-900/40 hover:border-[#0a5c36] dark:hover:border-green-600 shadow-xs flex items-center justify-between transition cursor-pointer"
                     >
                       <div className="flex items-center gap-3">
                         <div
                           className={`w-10 h-10 rounded-2xl flex items-center justify-center text-base font-bold shrink-0 ${
                             tx.type === 'data'
-                              ? 'bg-green-100 text-green-700'
+                              ? 'bg-green-100 dark:bg-green-950 text-green-700 dark:text-green-300'
                               : tx.type === 'airtime'
-                              ? 'bg-blue-100 text-blue-700'
+                              ? 'bg-blue-100 dark:bg-blue-950 text-blue-700 dark:text-blue-300'
                               : tx.type === 'electricity'
-                              ? 'bg-orange-100 text-orange-700'
+                              ? 'bg-orange-100 dark:bg-orange-950 text-orange-700 dark:text-orange-300'
                               : tx.type === 'cable'
-                              ? 'bg-purple-100 text-purple-700'
-                              : 'bg-lime-200 text-[#0a5c36]'
+                              ? 'bg-purple-100 dark:bg-purple-950 text-purple-700 dark:text-purple-300'
+                              : 'bg-lime-200 dark:bg-green-800 text-[#0a5c36] dark:text-[#d6ff00]'
                           }`}
                         >
                           {tx.type === 'data' && <i className="fa-solid fa-signal"></i>}
@@ -2318,7 +3616,7 @@ export default function App() {
                           {tx.type === 'funding' && <Wallet className="w-5 h-5" />}
                         </div>
                         <div className="overflow-hidden">
-                          <span className="text-xs font-bold text-gray-900 block truncate max-w-[190px]">
+                          <span className="text-xs font-bold text-gray-900 dark:text-white block truncate max-w-[190px]">
                             {tx.title}
                           </span>
                           <span className="text-[10px] text-gray-400 block font-mono truncate">
@@ -2329,12 +3627,12 @@ export default function App() {
                       <div className="text-right shrink-0">
                         <span
                           className={`text-sm font-black block ${
-                            tx.type === 'funding' ? 'text-green-600' : 'text-gray-900'
+                            tx.type === 'funding' ? 'text-green-600 dark:text-lime-400' : 'text-gray-900 dark:text-white'
                           }`}
                         >
                           {tx.type === 'funding' ? '+' : '-'}₦{tx.amount.toLocaleString()}
                         </span>
-                        <span className="text-[10px] text-green-600 font-bold bg-green-50 px-2 py-0.5 rounded-md">
+                        <span className="text-[10px] text-green-600 dark:text-lime-300 font-bold bg-green-50 dark:bg-green-950/80 px-2 py-0.5 rounded-md">
                           SUCCESS
                         </span>
                       </div>
@@ -2344,136 +3642,968 @@ export default function App() {
               )}
             </div>
           )}
+
+          {/* ==================================================== */}
+          {/* 7. SETTINGS & BIOMETRIC SECURITY MENU                */}
+          {/* ==================================================== */}
+          {activePage === 'settings' && (
+            <div className="space-y-4 animate-in fade-in">
+              {/* Settings Header */}
+              <div className="flex items-center justify-between pb-2 border-b border-gray-100 dark:border-green-900/40">
+                <div className="flex items-center gap-2.5">
+                  <button
+                    onClick={() => setActivePage('dashboard')}
+                    className="w-8 h-8 rounded-full bg-gray-100 dark:bg-[#162a20] hover:bg-gray-200 dark:hover:bg-[#1e382b] text-gray-700 dark:text-gray-200 flex items-center justify-center cursor-pointer transition"
+                    title="Back to Dashboard"
+                  >
+                    <ArrowLeft className="w-4 h-4" />
+                  </button>
+                  <div>
+                    <h2 className="text-base font-black text-gray-900 dark:text-white flex items-center gap-2">
+                      <Settings className="w-4 h-4 text-[#0a5c36] dark:text-[#d6ff00]" />
+                      Settings &amp; Security
+                    </h2>
+                    <span className="text-[10px] text-gray-500 dark:text-gray-400">
+                      Manage device biometrics, local session &amp; preferences
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* FEEDBACK BANNER */}
+              {biometricFeedback && (
+                <div
+                  className={`p-3.5 rounded-2xl text-xs font-semibold flex items-start gap-2.5 transition animate-in fade-in ${
+                    biometricFeedback.type === 'success'
+                      ? 'bg-green-50 dark:bg-green-950/80 text-green-800 dark:text-lime-300 border border-green-200 dark:border-green-800'
+                      : biometricFeedback.type === 'error'
+                      ? 'bg-red-50 dark:bg-red-950/80 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-900/50'
+                      : 'bg-blue-50 dark:bg-blue-950/80 text-blue-700 dark:text-blue-300 border border-blue-200 dark:border-blue-900/50'
+                  }`}
+                >
+                  {biometricFeedback.type === 'success' ? (
+                    <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 text-[#0a5c36] dark:text-[#d6ff00]" />
+                  ) : biometricFeedback.type === 'error' ? (
+                    <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  ) : (
+                    <Info className="w-4 h-4 shrink-0 mt-0.5" />
+                  )}
+                  <div className="flex-1 text-[11px] leading-relaxed">
+                    {biometricFeedback.text}
+                  </div>
+                  <button
+                    onClick={() => setBiometricFeedback(null)}
+                    className="text-xs opacity-60 hover:opacity-100 cursor-pointer ml-1"
+                  >
+                    ✕
+                  </button>
+                </div>
+              )}
+
+              {/* BIOMETRIC TOGGLE CARD (CORE REQUIREMENT) */}
+              <div className="p-4 rounded-[22px] bg-gradient-to-br from-white to-green-50/50 dark:from-[#102319] dark:to-[#0c1a13] border-2 border-green-200 dark:border-green-800/80 shadow-sm space-y-3.5">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-[#d6ff00] to-lime-400 text-[#0a5c36] flex items-center justify-center shadow-md shadow-lime-500/20 shrink-0">
+                      <Fingerprint className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-black text-gray-900 dark:text-white">
+                          Use Fingerprint / Face ID
+                        </h3>
+                        {isBiometricEnabled && (
+                          <span className="text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-full bg-green-100 dark:bg-green-900/80 text-[#0a5c36] dark:text-[#d6ff00]">
+                            Active
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-gray-600 dark:text-gray-300 mt-1 leading-relaxed">
+                        Secure your local session using the Web Authentication API. Unlock eHUB faster and safer with Touch ID, Face ID, Android Biometrics, or Windows Hello.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* TOGGLE SWITCH */}
+                  <div className="shrink-0 pt-0.5">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={isBiometricEnabled}
+                      disabled={!isBiometricSupported || biometricLoading}
+                      onClick={handleToggleBiometrics}
+                      className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-[#0a5c36] focus:ring-offset-2 dark:focus:ring-offset-[#102319] ${
+                        isBiometricEnabled
+                          ? 'bg-[#0a5c36] dark:bg-[#d6ff00]'
+                          : 'bg-gray-200 dark:bg-gray-700'
+                      } ${(!isBiometricSupported || biometricLoading) ? 'opacity-50 cursor-not-allowed' : ''}`}
+                    >
+                      <span
+                        aria-hidden="true"
+                        className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white dark:bg-[#073620] shadow-md ring-0 transition duration-200 ease-in-out flex items-center justify-center ${
+                          isBiometricEnabled ? 'translate-x-5' : 'translate-x-0'
+                        }`}
+                      >
+                        {biometricLoading ? (
+                          <RefreshCw className="w-3 h-3 text-[#0a5c36] dark:text-[#d6ff00] animate-spin" />
+                        ) : isBiometricEnabled ? (
+                          <Check className="w-3.5 h-3.5 text-[#0a5c36] dark:text-[#d6ff00]" />
+                        ) : (
+                          <span className="w-2 h-2 rounded-full bg-gray-400"></span>
+                        )}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* DEVICE CAPABILITY STATUS */}
+                <div className="pt-2 border-t border-gray-100 dark:border-green-900/40 space-y-2">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-gray-500 dark:text-gray-400 font-medium flex items-center gap-1.5">
+                      <ShieldCheck className="w-3.5 h-3.5 text-[#0a5c36] dark:text-[#d6ff00]" />
+                      Device Sensor Support:
+                    </span>
+                    {isBiometricSupported ? (
+                      <span className="font-bold text-[#0a5c36] dark:text-lime-300 bg-lime-100 dark:bg-green-950 px-2 py-0.5 rounded-lg text-[11px] flex items-center gap-1">
+                        ✓ WebAuthn Available
+                      </span>
+                    ) : (
+                      <span className="font-bold text-amber-700 dark:text-amber-300 bg-amber-100 dark:bg-amber-950/80 px-2 py-0.5 rounded-lg text-[11px]">
+                        Hardware Biometrics Unavailable
+                      </span>
+                    )}
+                  </div>
+
+                  {isBiometricEnabled && (
+                    <div className="flex items-center justify-between pt-1">
+                      <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                        Session key registered locally.
+                      </span>
+                      <button
+                        type="button"
+                        onClick={handleTestBiometrics}
+                        disabled={biometricLoading}
+                        className="px-3 py-1.5 rounded-xl bg-gray-100 dark:bg-green-900/40 hover:bg-gray-200 dark:hover:bg-green-800/60 text-[#0a5c36] dark:text-lime-300 text-xs font-bold transition flex items-center gap-1.5 cursor-pointer"
+                      >
+                        <Fingerprint className="w-3.5 h-3.5" />
+                        <span>Test Sensor Prompt</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* HARDWARE FIDO2 NOTE */}
+                <div className="p-3 rounded-xl bg-lime-50/80 dark:bg-[#0b1710] border border-lime-200/80 dark:border-green-900/50 text-[11px] text-gray-600 dark:text-gray-300 space-y-1">
+                  <div className="font-bold text-[#0a5c36] dark:text-lime-300 flex items-center gap-1.5">
+                    <KeyRound className="w-3.5 h-3.5" />
+                    <span>FIDO2 / Web Authentication API</span>
+                  </div>
+                  <p className="leading-relaxed text-[10.5px]">
+                    Your biometric raw prints never leave your device. The browser leverages hardware-backed public key credentials to securely authenticate your local session.
+                  </p>
+                </div>
+              </div>
+
+              {/* PUSH NOTIFICATIONS & BALANCE ALERTS CARD */}
+              <div className="p-4 rounded-[22px] bg-gradient-to-br from-white to-lime-50/40 dark:from-[#102319] dark:to-[#0c1a13] border-2 border-lime-300 dark:border-green-800 shadow-sm space-y-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-[#0a5c36] to-[#0f7a48] text-[#d6ff00] flex items-center justify-center shadow-md shadow-green-900/20 shrink-0">
+                      <BellRing className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-black text-gray-900 dark:text-white">
+                          Push Notifications &amp; Alerts
+                        </h3>
+                        {notificationSettings.pushEnabled && (
+                          <span className="text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-full bg-lime-100 dark:bg-green-900/80 text-[#0a5c36] dark:text-[#d6ff00]">
+                            Active
+                          </span>
+                        )}
+                      </div>
+                      <p className="text-xs text-gray-600 dark:text-gray-300 mt-1 leading-relaxed">
+                        Instant system push &amp; in-app pop-ups for successful data, airtime, and bill transactions, plus timely low balance warnings.
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* MASTER PUSH TOGGLE */}
+                  <div className="shrink-0 pt-0.5">
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={notificationSettings.pushEnabled}
+                      onClick={() => {
+                        const next = !notificationSettings.pushEnabled;
+                        updateNotificationSettings({ pushEnabled: next });
+                        if (next && browserPermission !== 'granted') {
+                          handleRequestPushPermission();
+                        }
+                      }}
+                      className={`relative inline-flex h-7 w-12 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-[#0a5c36] ${
+                        notificationSettings.pushEnabled
+                          ? 'bg-[#0a5c36] dark:bg-[#d6ff00]'
+                          : 'bg-gray-200 dark:bg-gray-700'
+                      }`}
+                    >
+                      <span
+                        className={`pointer-events-none inline-block h-6 w-6 transform rounded-full bg-white dark:bg-[#073620] shadow-md ring-0 transition duration-200 ease-in-out flex items-center justify-center ${
+                          notificationSettings.pushEnabled ? 'translate-x-5' : 'translate-x-0'
+                        }`}
+                      >
+                        {notificationSettings.pushEnabled ? (
+                          <Check className="w-3.5 h-3.5 text-[#0a5c36] dark:text-[#d6ff00]" />
+                        ) : (
+                          <span className="w-2 h-2 rounded-full bg-gray-400"></span>
+                        )}
+                      </span>
+                    </button>
+                  </div>
+                </div>
+
+                {/* BROWSER PERMISSION STATUS */}
+                <div className="p-3 rounded-xl bg-gray-50 dark:bg-[#0c1811] border border-gray-200/80 dark:border-green-900/40 text-xs flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <span className="text-gray-500 dark:text-gray-400 font-medium">Browser Push Status:</span>
+                    <span
+                      className={`font-black text-[11px] px-2 py-0.5 rounded-md ${
+                        browserPermission === 'granted'
+                          ? 'bg-green-100 dark:bg-green-950 text-green-800 dark:text-lime-300'
+                          : browserPermission === 'denied'
+                          ? 'bg-red-100 dark:bg-red-950 text-red-700 dark:text-red-300'
+                          : 'bg-amber-100 dark:bg-amber-950 text-amber-800 dark:text-amber-300'
+                      }`}
+                    >
+                      {browserPermission === 'granted'
+                        ? '✓ System Permission Granted'
+                        : browserPermission === 'denied'
+                        ? 'Blocked in Browser'
+                        : 'Permission Default'}
+                    </span>
+                  </div>
+                  {browserPermission !== 'granted' && isBrowserNotificationSupported() && (
+                    <button
+                      type="button"
+                      onClick={handleRequestPushPermission}
+                      className="px-2.5 py-1 bg-[#0a5c36] hover:bg-[#074729] dark:bg-green-700 text-white rounded-lg font-bold text-[11px] shadow-xs cursor-pointer"
+                    >
+                      Request System Push
+                    </button>
+                  )}
+                </div>
+
+                {/* INDIVIDUAL ALERT TOGGLES */}
+                <div className="space-y-3 pt-1 border-t border-gray-100 dark:border-green-900/40">
+                  {/* Transaction Status Alert */}
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="text-xs font-bold text-gray-900 dark:text-white flex items-center gap-1.5">
+                        <Zap className="w-3.5 h-3.5 text-[#0a5c36] dark:text-[#d6ff00]" />
+                        Successful Transaction Alerts
+                      </span>
+                      <span className="text-[11px] text-gray-500 dark:text-gray-400 block">
+                        Push alerts when data, airtime, AEDC tokens &amp; TV subs succeed
+                      </span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={notificationSettings.transactionSuccessAlerts}
+                      onChange={(e) => updateNotificationSettings({ transactionSuccessAlerts: e.target.checked })}
+                      className="w-4 h-4 text-[#0a5c36] accent-[#0a5c36] rounded cursor-pointer"
+                    />
+                  </div>
+
+                  {/* Low Balance Alert */}
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <span className="text-xs font-bold text-gray-900 dark:text-white flex items-center gap-1.5">
+                        <Wallet className="w-3.5 h-3.5 text-[#0a5c36] dark:text-[#d6ff00]" />
+                        Low Wallet Balance Alerts
+                      </span>
+                      <span className="text-[11px] text-gray-500 dark:text-gray-400 block">
+                        Warn when wallet balance drops below chosen threshold
+                      </span>
+                    </div>
+                    <input
+                      type="checkbox"
+                      checked={notificationSettings.lowBalanceAlerts}
+                      onChange={(e) => updateNotificationSettings({ lowBalanceAlerts: e.target.checked })}
+                      className="w-4 h-4 text-[#0a5c36] accent-[#0a5c36] rounded cursor-pointer"
+                    />
+                  </div>
+
+                  {/* Low Balance Threshold Selector */}
+                  {notificationSettings.lowBalanceAlerts && (
+                    <div className="p-3 rounded-xl bg-amber-50/70 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900/40 space-y-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-[11px] font-bold text-amber-900 dark:text-amber-200">
+                          Alert Threshold:
+                        </span>
+                        <span className="font-mono font-black text-xs text-amber-800 dark:text-amber-300">
+                          ₦{notificationSettings.lowBalanceThreshold.toLocaleString()}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-4 gap-1.5">
+                        {[200, 500, 1000, 2000].map((val) => (
+                          <button
+                            key={val}
+                            type="button"
+                            onClick={() => updateNotificationSettings({ lowBalanceThreshold: val })}
+                            className={`py-1.5 rounded-lg text-[11px] font-bold transition cursor-pointer border ${
+                              notificationSettings.lowBalanceThreshold === val
+                                ? 'bg-[#0a5c36] text-white border-[#0a5c36] dark:bg-green-700 dark:border-green-600'
+                                : 'bg-white dark:bg-[#12241b] text-gray-700 dark:text-gray-300 border-gray-200 dark:border-green-900/50 hover:bg-gray-100'
+                            }`}
+                          >
+                            ₦{val.toLocaleString()}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Sound & Vibration Options */}
+                  <div className="grid grid-cols-2 gap-2 pt-1">
+                    <label className="flex items-center gap-2 p-2.5 rounded-xl bg-gray-50 dark:bg-[#0c1811] border border-gray-200 dark:border-green-900/40 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={notificationSettings.soundEnabled}
+                        onChange={(e) => updateNotificationSettings({ soundEnabled: e.target.checked })}
+                        className="w-3.5 h-3.5 accent-[#0a5c36] rounded"
+                      />
+                      <Volume2 className="w-3.5 h-3.5 text-gray-600 dark:text-gray-300" />
+                      <span className="text-[11px] font-bold text-gray-800 dark:text-gray-200">Audio Chimes</span>
+                    </label>
+
+                    <label className="flex items-center gap-2 p-2.5 rounded-xl bg-gray-50 dark:bg-[#0c1811] border border-gray-200 dark:border-green-900/40 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={notificationSettings.vibrateEnabled}
+                        onChange={(e) => updateNotificationSettings({ vibrateEnabled: e.target.checked })}
+                        className="w-3.5 h-3.5 accent-[#0a5c36] rounded"
+                      />
+                      <Sparkles className="w-3.5 h-3.5 text-gray-600 dark:text-gray-300" />
+                      <span className="text-[11px] font-bold text-gray-800 dark:text-gray-200">Vibration</span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* TEST BUTTONS */}
+                <div className="pt-2 border-t border-gray-100 dark:border-green-900/40 space-y-2">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-gray-400 block">
+                    Test Real-time Alerts:
+                  </span>
+                  <div className="grid grid-cols-2 gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleSendTestNotification('success')}
+                      className="py-2 px-3 rounded-xl bg-green-50 dark:bg-green-950/70 border border-green-200 dark:border-green-800 hover:bg-green-100 text-[#0a5c36] dark:text-lime-300 font-bold text-[11px] flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      <Zap className="w-3.5 h-3.5" />
+                      <span>Test Success Alert</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleSendTestNotification('low_balance')}
+                      className="py-2 px-3 rounded-xl bg-amber-50 dark:bg-amber-950/70 border border-amber-200 dark:border-amber-800 hover:bg-amber-100 text-amber-800 dark:text-amber-300 font-bold text-[11px] flex items-center justify-center gap-1.5 transition cursor-pointer"
+                    >
+                      <AlertCircle className="w-3.5 h-3.5" />
+                      <span>Test Low Balance</span>
+                    </button>
+                  </div>
+                  {notificationStatusMsg && (
+                    <div className="p-2 rounded-lg bg-green-100 dark:bg-green-950 text-[#0a5c36] dark:text-lime-300 text-[10px] font-semibold text-center animate-in fade-in">
+                      {notificationStatusMsg}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* ==================================================== */}
+              {/* REFERRALS & REWARDS PROGRAM SECTION (CORE REQUIREMENT) */}
+              {/* ==================================================== */}
+              <div className="p-4 rounded-[22px] bg-gradient-to-br from-white via-green-50/40 to-lime-50/40 dark:from-[#102319] dark:to-[#0c1a13] border-2 border-lime-300 dark:border-green-800 shadow-sm space-y-4">
+                {/* Header */}
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-3">
+                    <div className="w-11 h-11 rounded-2xl bg-gradient-to-br from-[#d6ff00] to-lime-400 text-[#0a5c36] flex items-center justify-center shadow-md shadow-lime-500/20 shrink-0">
+                      <Gift className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <h3 className="text-sm font-black text-gray-900 dark:text-white">
+                          Referrals &amp; Rewards
+                        </h3>
+                        <span className="text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-full bg-lime-100 dark:bg-green-900/80 text-[#0a5c36] dark:text-[#d6ff00]">
+                          +₦100 / signup
+                        </span>
+                      </div>
+                      <p className="text-xs text-gray-600 dark:text-gray-300 mt-1 leading-relaxed">
+                        Invite colleagues, family, and friends to eHUB. Earn an instant <strong>₦100.00 wallet bonus</strong> for every new user who signs up with your link.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* EARNINGS & STATS COUNTERS */}
+                <div className="grid grid-cols-3 gap-2 p-3 rounded-2xl bg-white/90 dark:bg-[#0b1710] border border-lime-200 dark:border-green-900/60 shadow-xs">
+                  <div className="text-center">
+                    <span className="text-[10px] font-bold text-gray-500 dark:text-gray-400 block uppercase">
+                      Total Earned
+                    </span>
+                    <span className="text-sm font-black text-[#0a5c36] dark:text-[#d6ff00] mt-0.5 block font-mono">
+                      ₦{(currentUser.referralEarnings || 0).toLocaleString('en-NG', { minimumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                  <div className="text-center border-x border-gray-100 dark:border-green-900/40">
+                    <span className="text-[10px] font-bold text-gray-500 dark:text-gray-400 block uppercase">
+                      Friends Joined
+                    </span>
+                    <span className="text-sm font-black text-gray-900 dark:text-white mt-0.5 block">
+                      {currentUser.referralCount || (currentUser.referredUsers ? currentUser.referredUsers.length : 0)}
+                    </span>
+                  </div>
+                  <div className="text-center">
+                    <span className="text-[10px] font-bold text-gray-500 dark:text-gray-400 block uppercase">
+                      Reward Rate
+                    </span>
+                    <span className="text-sm font-black text-lime-600 dark:text-lime-300 mt-0.5 block">
+                      ₦100 / user
+                    </span>
+                  </div>
+                </div>
+
+                {/* YOUR UNIQUE REFERRAL CODE */}
+                <div className="space-y-1.5">
+                  <label className="text-[11px] font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider block">
+                    Your Personal Referral Code
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 px-4 py-2.5 rounded-xl bg-gray-100 dark:bg-[#07130b] border border-gray-200 dark:border-green-900/60 flex items-center justify-between">
+                      <span className="font-mono font-black text-base tracking-widest text-[#0a5c36] dark:text-[#d6ff00]">
+                        {currentUser.referralCode || 'EHUB'}
+                      </span>
+                      <span className="text-[10px] text-gray-400 font-sans uppercase">Tap to copy</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleCopyReferral('code')}
+                      className={`px-4 py-2.5 rounded-xl font-bold text-xs flex items-center gap-1.5 transition shadow-xs cursor-pointer ${
+                        referralCopied === 'code'
+                          ? 'bg-green-700 text-white'
+                          : 'bg-[#0a5c36] hover:bg-[#074729] dark:bg-green-700 dark:hover:bg-green-600 text-white'
+                      }`}
+                    >
+                      {referralCopied === 'code' ? (
+                        <>
+                          <Check className="w-3.5 h-3.5" />
+                          <span>Copied!</span>
+                        </>
+                      ) : (
+                        <>
+                          <Copy className="w-3.5 h-3.5" />
+                          <span>Copy Code</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* DIRECT SHARE LINK */}
+                <div className="space-y-1.5">
+                  <label className="text-[11px] font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider block">
+                    Direct Referral Link
+                  </label>
+                  <div className="p-2.5 rounded-xl bg-gray-50 dark:bg-[#07130b] border border-gray-200 dark:border-green-900/60 flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-mono text-gray-600 dark:text-gray-400 truncate select-all">
+                      {getReferralShareLink(currentUser.referralCode || 'EHUB')}
+                    </span>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => handleCopyReferral('link')}
+                        className="p-1.5 px-2 rounded-lg bg-gray-200 dark:bg-green-900/50 hover:bg-gray-300 dark:hover:bg-green-800 text-gray-700 dark:text-lime-300 text-[11px] font-bold flex items-center gap-1 cursor-pointer transition"
+                        title="Copy Link"
+                      >
+                        {referralCopied === 'link' ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                        <span>{referralCopied === 'link' ? 'Copied' : 'Copy'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleNativeShare}
+                        className="p-1.5 px-2 rounded-lg bg-[#d6ff00] hover:bg-lime-400 text-[#0a5c36] text-[11px] font-bold flex items-center gap-1 cursor-pointer transition shadow-xs"
+                        title="Share on WhatsApp, SMS, or Telegram"
+                      >
+                        <Share2 className="w-3 h-3" />
+                        <span>Share</span>
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* HOW IT WORKS BANNER */}
+                <div className="p-3 rounded-xl bg-lime-50/70 dark:bg-[#0b1710] border border-lime-200 dark:border-green-900/50 space-y-1.5">
+                  <span className="text-[11px] font-bold text-[#0a5c36] dark:text-lime-300 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    How to Earn ₦100 Referrals:
+                  </span>
+                  <div className="grid grid-cols-3 gap-2 text-[10px] text-gray-600 dark:text-gray-300">
+                    <div className="p-1.5 rounded-lg bg-white/70 dark:bg-black/20 text-center">
+                      <span className="font-bold text-[#0a5c36] dark:text-[#d6ff00] block text-xs">1</span>
+                      <span>Send code or link to friends</span>
+                    </div>
+                    <div className="p-1.5 rounded-lg bg-white/70 dark:bg-black/20 text-center">
+                      <span className="font-bold text-[#0a5c36] dark:text-[#d6ff00] block text-xs">2</span>
+                      <span>Friend signs up on eHUB</span>
+                    </div>
+                    <div className="p-1.5 rounded-lg bg-white/70 dark:bg-black/20 text-center">
+                      <span className="font-bold text-[#0a5c36] dark:text-[#d6ff00] block text-xs">3</span>
+                      <span>₦100 credited directly to wallet</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* REFERRED FRIENDS HISTORY LIST */}
+                <div className="pt-2 border-t border-gray-100 dark:border-green-900/40 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-gray-800 dark:text-gray-200 flex items-center gap-1.5">
+                      <Users className="w-3.5 h-3.5 text-[#0a5c36] dark:text-[#d6ff00]" />
+                      Referred Friends
+                    </span>
+                    <span className="text-[10px] text-gray-400 font-mono">
+                      {(currentUser.referredUsers?.length || 0)} registered
+                    </span>
+                  </div>
+
+                  {currentUser.referredUsers && currentUser.referredUsers.length > 0 ? (
+                    <div className="space-y-1.5 max-h-40 overflow-y-auto">
+                      {currentUser.referredUsers.map((item, idx) => (
+                        <div
+                          key={idx}
+                          className="p-2 rounded-xl bg-white dark:bg-[#07130b] border border-gray-100 dark:border-green-900/30 flex items-center justify-between text-xs"
+                        >
+                          <div>
+                            <span className="font-bold text-gray-900 dark:text-white block text-[11px]">
+                              {item.displayName || 'eHUB Friend'}
+                            </span>
+                            <span className="text-[10px] text-gray-400 font-mono">
+                              {item.email} • {new Date(item.date).toLocaleDateString()}
+                            </span>
+                          </div>
+                          <span className="font-mono font-black text-[#0a5c36] dark:text-[#d6ff00] bg-lime-100 dark:bg-green-900/50 px-2 py-0.5 rounded-md text-[11px]">
+                            +₦{item.bonus || 100}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="p-3 rounded-xl bg-gray-50 dark:bg-[#08150d] text-center text-xs text-gray-500 dark:text-gray-400">
+                      No referrals yet. Share your code above with friends to earn your first ₦100 bonus!
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* ACCOUNT & LOCAL SESSION CARD */}
+              <div className="p-4 rounded-[22px] bg-white dark:bg-[#12241b] border border-gray-200 dark:border-green-900/40 shadow-xs space-y-3">
+                <h3 className="text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider flex items-center gap-2">
+                  <UserIcon className="w-3.5 h-3.5 text-[#0a5c36] dark:text-[#d6ff00]" />
+                  Active User Session
+                </h3>
+
+                <div className="space-y-2 text-xs">
+                  <div className="flex justify-between items-center py-1.5 border-b border-gray-100 dark:border-green-900/30">
+                    <span className="text-gray-500 dark:text-gray-400">Full Name</span>
+                    <span className="font-bold text-gray-900 dark:text-white">{currentUser.displayName}</span>
+                  </div>
+                  <div className="flex justify-between items-center py-1.5 border-b border-gray-100 dark:border-green-900/30">
+                    <span className="text-gray-500 dark:text-gray-400">Email Address</span>
+                    <span className="font-mono text-gray-900 dark:text-white text-[11px]">{currentUser.email}</span>
+                  </div>
+                  <div className="flex justify-between items-center py-1.5 border-b border-gray-100 dark:border-green-900/30">
+                    <span className="text-gray-500 dark:text-gray-400">Wallet Balance</span>
+                    <span className="font-black text-[#0a5c36] dark:text-[#d6ff00]">
+                      ₦{currentUser.balance.toLocaleString('en-NG', { minimumFractionDigits: 2 })}
+                    </span>
+                  </div>
+                  <div className="flex justify-between items-center py-1.5">
+                    <span className="text-gray-500 dark:text-gray-400">Local Security</span>
+                    <span className="font-semibold text-gray-800 dark:text-gray-200">
+                      {isBiometricEnabled ? 'Fingerprint / Face ID Protected' : 'Standard Password'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+
+              {/* APP PREFERENCES & THEME */}
+              <div className="p-4 rounded-[22px] bg-white dark:bg-[#12241b] border border-gray-200 dark:border-green-900/40 shadow-xs space-y-3">
+                <h3 className="text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider flex items-center gap-2">
+                  <SlidersHorizontal className="w-3.5 h-3.5 text-[#0a5c36] dark:text-[#d6ff00]" />
+                  Display &amp; System Preferences
+                </h3>
+
+                <div className="flex items-center justify-between py-1">
+                  <div>
+                    <span className="text-xs font-bold text-gray-900 dark:text-white block">Theme Mode</span>
+                    <span className="text-[11px] text-gray-500 dark:text-gray-400">
+                      {theme === 'dark' ? 'Dark green night theme' : 'Crisp daylight theme'}
+                    </span>
+                  </div>
+                  <button
+                    onClick={toggleTheme}
+                    className="p-2 px-3 rounded-xl bg-gray-100 dark:bg-green-900/50 hover:bg-gray-200 dark:hover:bg-green-800/60 text-[#0a5c36] dark:text-[#d6ff00] transition cursor-pointer flex items-center gap-1.5 text-xs font-bold"
+                  >
+                    {theme === 'dark' ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+                    <span>{theme === 'dark' ? 'Light' : 'Dark'}</span>
+                  </button>
+                </div>
+
+                <div className="pt-2 border-t border-gray-100 dark:border-green-900/30 flex items-center justify-between text-xs">
+                  <span className="text-gray-500 dark:text-gray-400">Telecom API Endpoint</span>
+                  <span className="font-mono text-[11px] text-gray-700 dark:text-gray-300">ClubKonnect / Abuja AEDC</span>
+                </div>
+              </div>
+
+              {/* RETURN BUTTON */}
+              <button
+                onClick={() => setActivePage('dashboard')}
+                className="w-full py-3 bg-[#0a5c36] hover:bg-[#074729] dark:bg-green-700 dark:hover:bg-green-600 text-white font-bold rounded-2xl transition text-xs shadow-md cursor-pointer flex items-center justify-center gap-2"
+              >
+                <ArrowLeft className="w-3.5 h-3.5" />
+                <span>Return to Dashboard</span>
+              </button>
+            </div>
+          )}
         </main>
 
-        {/* BOTTOM NAVIGATION / FOOTER */}
-        <footer className="bg-gray-50 border-t border-gray-200 px-4 py-3 text-center">
-          <div className="flex items-center justify-around mb-2">
-            <button
-              onClick={() => setActivePage('dashboard')}
-              className={`flex flex-col items-center text-[10px] font-bold cursor-pointer ${
-                activePage === 'dashboard' ? 'text-[#0a5c36]' : 'text-gray-400 hover:text-gray-600'
-              }`}
-            >
-              <i className="fa-solid fa-house text-base mb-1"></i>
-              <span>Home</span>
-            </button>
-            <button
-              onClick={() => setActivePage('data')}
-              className={`flex flex-col items-center text-[10px] font-bold cursor-pointer ${
-                activePage === 'data' ? 'text-[#0a5c36]' : 'text-gray-400 hover:text-gray-600'
-              }`}
-            >
-              <i className="fa-solid fa-signal text-base mb-1"></i>
-              <span>Data</span>
-            </button>
-            <button
-              onClick={() => setIsFundModalOpen(true)}
-              className="flex flex-col items-center text-[10px] font-bold text-[#0a5c36] cursor-pointer"
-            >
-              <div className="w-8 h-8 rounded-full bg-[#0a5c36] text-[#d6ff00] flex items-center justify-center -mt-3 shadow-md border-2 border-white">
-                <PlusCircle className="w-5 h-5" />
-              </div>
-              <span className="mt-0.5">Fund</span>
-            </button>
-            <button
-              onClick={() => setActivePage('electricity')}
-              className={`flex flex-col items-center text-[10px] font-bold cursor-pointer ${
-                activePage === 'electricity' ? 'text-[#0a5c36]' : 'text-gray-400 hover:text-gray-600'
-              }`}
-            >
-              <i className="fa-solid fa-lightbulb text-base mb-1"></i>
-              <span>Bills</span>
-            </button>
-            <button
-              onClick={() => setActivePage('history')}
-              className={`flex flex-col items-center text-[10px] font-bold cursor-pointer ${
-                activePage === 'history' ? 'text-[#0a5c36]' : 'text-gray-400 hover:text-gray-600'
-              }`}
-            >
-              <i className="fa-solid fa-receipt text-base mb-1"></i>
-              <span>History</span>
-            </button>
-          </div>
-          <p className="text-[10px] text-gray-400 font-medium pt-1 border-t border-gray-100">
-            Powered by ClubKonnect API &amp; Paystack
-          </p>
-        </footer>
+        {/* FLAT FLOATING BOTTOM NAVIGATION DOCK (Home Data Airtime Transactions Wallet) */}
+        <nav
+          aria-label="Bottom Navigation"
+          className="fixed bottom-5 left-1/2 -translate-x-1/2 z-40 w-[94%] max-w-lg bg-white/95 dark:bg-[#0e2116]/95 backdrop-blur-md rounded-[24px] shadow-soft-lg border border-gray-100 dark:border-green-900/40 p-2 sm:p-2.5 flex items-center justify-around transition-all"
+        >
+          <button
+            type="button"
+            onClick={() => {
+              setActivePage('dashboard');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
+            className={`flex flex-col items-center gap-1 text-[11px] font-heading font-sora font-extrabold cursor-pointer py-1.5 px-3 rounded-2xl transition-all ${
+              activePage === 'dashboard'
+                ? 'text-[#0FA958] bg-[#0FA958]/10 dark:bg-[#0FA958]/25'
+                : 'text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white'
+            }`}
+          >
+            <i className="fa-solid fa-house text-base"></i>
+            <span>Home</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setActivePage('dashboard');
+              setTimeout(() => {
+                document.getElementById('section-data')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }, 50);
+            }}
+            className="flex flex-col items-center gap-1 text-[11px] font-heading font-sora font-extrabold cursor-pointer py-1.5 px-3 rounded-2xl text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white transition-all"
+          >
+            <i className="fa-solid fa-signal text-base"></i>
+            <span>Data</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              setActivePage('dashboard');
+              setTimeout(() => {
+                document.getElementById('section-airtime')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+              }, 50);
+            }}
+            className="flex flex-col items-center gap-1 text-[11px] font-heading font-sora font-extrabold cursor-pointer py-1.5 px-3 rounded-2xl text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white transition-all"
+          >
+            <i className="fa-solid fa-phone text-base"></i>
+            <span>Airtime</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setActivePage('history')}
+            className={`flex flex-col items-center gap-1 text-[11px] font-heading font-sora font-extrabold cursor-pointer py-1.5 px-3 rounded-2xl transition-all ${
+              activePage === 'history'
+                ? 'text-[#0FA958] bg-[#0FA958]/10 dark:bg-[#0FA958]/25'
+                : 'text-gray-500 hover:text-gray-900 dark:text-gray-400 dark:hover:text-white'
+            }`}
+          >
+            <i className="fa-solid fa-receipt text-base"></i>
+            <span>Transactions</span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setIsFundModalOpen(true)}
+            className="flex flex-col items-center gap-1 text-[11px] font-heading font-sora font-extrabold text-[#0FA958] hover:text-[#0c8f49] cursor-pointer py-1.5 px-3 rounded-2xl hover:bg-[#0FA958]/10 transition-all"
+          >
+            <Wallet className="w-4 h-4" />
+            <span>Wallet</span>
+          </button>
+        </nav>
+
+        {/* Brand Credit */}
+        <div className="text-center text-xs text-white/80 dark:text-white/60 font-medium pt-4 pb-8">
+          <span>eHUB Telecom &bull; Abuja Telecom Center &bull; Powered by ClubKonnect API &amp; Paystack</span>
+        </div>
       </div>
 
       {/* ==================================================== */}
       {/* MODAL: FUND WALLET (PAYSTACK INTEGRATION)            */}
       {/* ==================================================== */}
       {isFundModalOpen && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-sm bg-white rounded-[26px] p-6 shadow-2xl space-y-4 animate-in fade-in zoom-in-95">
-            <div className="flex items-center justify-between pb-2 border-b border-gray-100">
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
+          <div className="w-full max-w-md bg-white dark:bg-[#0f1f17] rounded-[26px] p-5 sm:p-6 shadow-2xl space-y-4 animate-in fade-in zoom-in-95 border border-transparent dark:border-green-900/40 my-auto max-h-[92vh] flex flex-col">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between pb-2 border-b border-gray-100 dark:border-green-900/40 shrink-0">
               <div className="flex items-center gap-2">
-                <div className="w-8 h-8 rounded-xl bg-lime-100 text-[#0a5c36] flex items-center justify-center">
-                  <CreditCard className="w-4 h-4" />
+                <div className="w-8 h-8 rounded-xl bg-lime-100 dark:bg-green-950 text-[#0a5c36] dark:text-[#d6ff00] flex items-center justify-center">
+                  <Wallet className="w-4 h-4" />
                 </div>
-                <h3 className="text-base font-black text-gray-900">Fund Your Wallet</h3>
+                <div>
+                  <h3 className="text-base font-black text-gray-900 dark:text-white leading-tight">Fund Your Wallet</h3>
+                  <span className="text-[10px] text-gray-500 dark:text-gray-400">Choose your preferred payment channel</span>
+                </div>
               </div>
               <button
                 onClick={() => setIsFundModalOpen(false)}
-                className="w-7 h-7 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-600 flex items-center justify-center text-xs font-bold cursor-pointer"
+                className="w-7 h-7 rounded-full bg-gray-100 dark:bg-[#162a20] hover:bg-gray-200 dark:hover:bg-[#1e382b] text-gray-600 dark:text-gray-300 flex items-center justify-center text-xs font-bold cursor-pointer"
               >
                 ✕
               </button>
             </div>
 
-            <p className="text-xs text-gray-500">
-              Pay via Paystack online checkout (Card, Bank Transfer, USSD). Your eHUB balance will be credited automatically.
-            </p>
-
-            <div>
-              <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
-                Funding Amount (₦)
-              </label>
-              <input
-                type="number"
-                min={100}
-                step={100}
-                value={customFundInput}
-                onChange={(e) => {
-                  setCustomFundInput(e.target.value);
-                  setFundAmount(Number(e.target.value));
-                }}
-                className="w-full px-4 py-3 rounded-2xl border border-gray-300 font-black text-lg focus:outline-none focus:ring-2 focus:ring-[#0a5c36]"
-              />
-
-              <div className="grid grid-cols-3 gap-2 mt-2.5">
-                {[500, 1000, 2000, 5000, 10000, 20000].map((val) => (
-                  <button
-                    key={val}
-                    type="button"
-                    onClick={() => {
-                      setCustomFundInput(String(val));
-                      setFundAmount(val);
-                    }}
-                    className={`py-2 rounded-xl text-xs font-bold border transition cursor-pointer ${
-                      fundAmount === val
-                        ? 'bg-[#0a5c36] text-white border-[#0a5c36]'
-                        : 'bg-gray-50 border-gray-200 text-gray-700 hover:bg-gray-100'
-                    }`}
-                  >
-                    ₦{val.toLocaleString()}
-                  </button>
-                ))}
-              </div>
+            {/* Funding Channel Tabs */}
+            <div className="grid grid-cols-2 p-1 bg-gray-100 dark:bg-[#08150d] rounded-2xl shrink-0">
+              <button
+                type="button"
+                onClick={() => setFundMethod('bank_transfer')}
+                className={`py-2 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition cursor-pointer ${
+                  fundMethod === 'bank_transfer'
+                    ? 'bg-white dark:bg-[#152e20] text-[#0a5c36] dark:text-[#d6ff00] shadow-xs'
+                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-800'
+                }`}
+              >
+                <Building2 className="w-3.5 h-3.5" />
+                <span>Bank Transfer</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setFundMethod('card_paystack')}
+                className={`py-2 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition cursor-pointer ${
+                  fundMethod === 'card_paystack'
+                    ? 'bg-white dark:bg-[#152e20] text-[#0a5c36] dark:text-[#d6ff00] shadow-xs'
+                    : 'text-gray-500 dark:text-gray-400 hover:text-gray-800'
+                }`}
+              >
+                <CreditCard className="w-3.5 h-3.5" />
+                <span>Card / Online</span>
+              </button>
             </div>
 
-            <button
-              onClick={() => triggerFundWallet(fundAmount)}
-              disabled={isProcessingFunding}
-              className="w-full py-3.5 bg-[#0a5c36] hover:bg-[#074729] text-white font-black rounded-2xl shadow-md text-sm flex items-center justify-center gap-2 transition cursor-pointer"
-            >
-              <Zap className="w-4 h-4 text-[#d6ff00]" />
-              <span>Proceed to Paystack (₦{fundAmount.toLocaleString()})</span>
-            </button>
+            {/* Scrollable Content Body */}
+            <div className="overflow-y-auto space-y-4 flex-1 pr-1">
+              {fundMethod === 'bank_transfer' ? (
+                <>
+                  {/* Bank Selector Section */}
+                  <div className="space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider block">
+                        Select Your Sending Bank
+                      </label>
+                      {selectedFundBank && (
+                        <span className="text-[10.5px] font-bold text-[#0a5c36] dark:text-[#d6ff00] flex items-center gap-1">
+                          <Check className="w-3 h-3" /> {selectedFundBank.name}
+                        </span>
+                      )}
+                    </div>
+                    
+                    {/* The User-defined Searchable Bank List with Logos */}
+                    <BankListSelector
+                      selectedBank={selectedFundBank}
+                      onSelectBank={(bank) => setSelectedFundBank(bank)}
+                    />
+                  </div>
 
-            <div className="p-2.5 rounded-xl bg-gray-50 text-[10px] text-gray-500 text-center font-mono">
-              Paystack Key: {CONFIG.PAYSTACK_PUBLIC_KEY.slice(0, 16)}...
+                  {/* Dedicated Virtual Account Card */}
+                  <div className="p-3.5 rounded-2xl bg-gradient-to-br from-green-50 to-lime-50/50 dark:from-[#0d1d14] dark:to-[#07130b] border-2 border-green-200 dark:border-green-800/80 shadow-xs space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-extrabold uppercase text-[#0a5c36] dark:text-[#d6ff00] flex items-center gap-1.5">
+                        <ShieldCheck className="w-3.5 h-3.5" />
+                        Dedicated Moniepoint Virtual Account
+                      </span>
+                      <span className="text-[10px] bg-green-100 dark:bg-green-900/60 text-green-800 dark:text-green-300 font-bold px-2 py-0.5 rounded-md">
+                        Auto-Credit
+                      </span>
+                    </div>
+
+                    <div className="bg-white dark:bg-[#12241b] p-3 rounded-xl border border-green-200/60 dark:border-green-900/40 flex items-center justify-between">
+                      <div>
+                        <span className="text-[10px] text-gray-500 dark:text-gray-400 block uppercase">
+                          Moniepoint MFB • Account Number
+                        </span>
+                        <span className="font-mono font-black text-lg text-gray-900 dark:text-white tracking-wider">
+                          8109283719
+                        </span>
+                        <span className="text-[11px] text-gray-600 dark:text-gray-300 block font-semibold">
+                          eHUB / {currentUser?.displayName || 'Valued User'}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleCopyAccountNumber('8109283719')}
+                        className={`px-3 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1 cursor-pointer shrink-0 ${
+                          copiedAccount
+                            ? 'bg-green-700 text-white'
+                            : 'bg-[#0a5c36] hover:bg-[#074729] dark:bg-green-700 dark:hover:bg-green-600 text-white shadow-xs'
+                        }`}
+                      >
+                        {copiedAccount ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                        <span>{copiedAccount ? 'Copied' : 'Copy'}</span>
+                      </button>
+                    </div>
+
+                    {selectedFundBank && (
+                      <div className="flex items-center justify-between text-[11px] text-gray-600 dark:text-gray-300 pt-0.5">
+                        <div className="flex items-center gap-1.5 truncate">
+                          <img
+                            src={selectedFundBank.logo}
+                            alt=""
+                            className="w-4 h-4 rounded-full object-contain bg-white shrink-0"
+                            onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                          />
+                          <span className="truncate">Sending from <strong>{selectedFundBank.name}</strong></span>
+                        </div>
+                        <span className="font-mono text-[10px] text-gray-500 dark:text-gray-400 shrink-0">
+                          USSD: <strong>{selectedFundBank.ussd}</strong>
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Transfer Amount Input & Presets */}
+                  <div>
+                    <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1">
+                      Amount to Transfer (₦)
+                    </label>
+                    <input
+                      type="number"
+                      min={100}
+                      step={100}
+                      value={customFundInput}
+                      onChange={(e) => {
+                        setCustomFundInput(e.target.value);
+                        setFundAmount(Number(e.target.value));
+                      }}
+                      className="w-full px-4 py-2.5 rounded-xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white font-black text-base focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600"
+                    />
+
+                    <div className="grid grid-cols-4 gap-1.5 mt-2">
+                      {[500, 1000, 2000, 5000].map((val) => (
+                        <button
+                          key={val}
+                          type="button"
+                          onClick={() => {
+                            setCustomFundInput(String(val));
+                            setFundAmount(val);
+                          }}
+                          className={`py-1.5 rounded-lg text-[11px] font-bold border transition cursor-pointer ${
+                            fundAmount === val
+                              ? 'bg-[#0a5c36] text-white border-[#0a5c36] dark:bg-green-700 dark:border-green-600'
+                              : 'bg-gray-50 dark:bg-[#12241b] border-gray-200 dark:border-green-900/50 text-gray-700 dark:text-gray-200 hover:bg-gray-100'
+                          }`}
+                        >
+                          ₦{val.toLocaleString()}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Confirmation Button */}
+                  <button
+                    type="button"
+                    onClick={() => handleBankTransferFunding(fundAmount, selectedFundBank)}
+                    disabled={isProcessingFunding}
+                    className="w-full py-3.5 bg-[#0a5c36] hover:bg-[#074729] dark:bg-green-700 dark:hover:bg-green-600 text-white font-black rounded-2xl shadow-md text-sm flex items-center justify-center gap-2 transition cursor-pointer"
+                  >
+                    {isProcessingFunding ? (
+                      <>
+                        <RefreshCw className="w-4 h-4 text-[#d6ff00] animate-spin" />
+                        <span>Verifying Bank Transfer...</span>
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle2 className="w-4 h-4 text-[#d6ff00]" />
+                        <span>I Have Transferred ₦{fundAmount.toLocaleString()}</span>
+                      </>
+                    )}
+                  </button>
+                </>
+              ) : (
+                /* Card / Paystack Tab */
+                <div className="space-y-4">
+                  <p className="text-xs text-gray-500 dark:text-gray-400">
+                    Pay securely using your Debit Card (Mastercard, Visa, Verve) via Paystack online gateway.
+                  </p>
+
+                  <div>
+                    <label className="block text-xs font-bold text-gray-700 dark:text-gray-300 uppercase tracking-wider mb-1.5">
+                      Funding Amount (₦)
+                    </label>
+                    <input
+                      type="number"
+                      min={100}
+                      step={100}
+                      value={customFundInput}
+                      onChange={(e) => {
+                        setCustomFundInput(e.target.value);
+                        setFundAmount(Number(e.target.value));
+                      }}
+                      className="w-full px-4 py-3 rounded-2xl border border-gray-300 dark:border-green-900/60 bg-white dark:bg-[#0c1912] text-gray-900 dark:text-white font-black text-lg focus:outline-none focus:ring-2 focus:ring-[#0a5c36] dark:focus:ring-green-600"
+                    />
+
+                    <div className="grid grid-cols-3 gap-2 mt-2.5">
+                      {[500, 1000, 2000, 5000, 10000, 20000].map((val) => (
+                        <button
+                          key={val}
+                          type="button"
+                          onClick={() => {
+                            setCustomFundInput(String(val));
+                            setFundAmount(val);
+                          }}
+                          className={`py-2 rounded-xl text-xs font-bold border transition cursor-pointer ${
+                            fundAmount === val
+                              ? 'bg-[#0a5c36] text-white border-[#0a5c36] dark:bg-green-700 dark:border-green-600'
+                              : 'bg-gray-50 dark:bg-[#12241b] border-gray-200 dark:border-green-900/50 text-gray-700 dark:text-gray-200 hover:bg-gray-100 dark:hover:bg-[#162c21]'
+                          }`}
+                        >
+                          ₦{val.toLocaleString()}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={() => triggerFundWallet(fundAmount)}
+                    disabled={isProcessingFunding}
+                    className="w-full py-3.5 bg-[#0a5c36] hover:bg-[#074729] dark:bg-green-700 dark:hover:bg-green-600 text-white font-black rounded-2xl shadow-md text-sm flex items-center justify-center gap-2 transition cursor-pointer"
+                  >
+                    <Zap className="w-4 h-4 text-[#d6ff00]" />
+                    <span>Proceed to Paystack (₦{fundAmount.toLocaleString()})</span>
+                  </button>
+
+                  <div className="p-2.5 rounded-xl bg-gray-50 dark:bg-[#0c1912] text-[10px] text-gray-500 dark:text-gray-400 text-center font-mono border border-transparent dark:border-green-900/40">
+                    Paystack Key: {CONFIG.PAYSTACK_PUBLIC_KEY.slice(0, 16)}...
+                  </div>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -2484,26 +4614,26 @@ export default function App() {
       {/* ==================================================== */}
       {successReceipt && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-sm bg-white rounded-[26px] p-6 shadow-2xl space-y-4 animate-in fade-in zoom-in-95">
+          <div className="w-full max-w-sm bg-white dark:bg-[#0f1f17] rounded-[26px] p-6 shadow-2xl space-y-4 animate-in fade-in zoom-in-95 border border-transparent dark:border-green-900/40">
             <div className="text-center">
-              <div className="w-14 h-14 rounded-full bg-green-100 text-[#0a5c36] flex items-center justify-center mx-auto mb-3 shadow-inner">
+              <div className="w-14 h-14 rounded-full bg-green-100 dark:bg-green-950 text-[#0a5c36] dark:text-[#d6ff00] flex items-center justify-center mx-auto mb-3 shadow-inner">
                 <CheckCircle2 className="w-8 h-8" />
               </div>
-              <h3 className="text-lg font-black text-gray-900">Transaction Successful!</h3>
-              <p className="text-xs text-gray-500 mt-0.5">{successReceipt.title}</p>
+              <h3 className="text-lg font-black text-gray-900 dark:text-white">Transaction Successful!</h3>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{successReceipt.title}</p>
             </div>
 
             {successReceipt.token && (
-              <div className="p-3.5 rounded-2xl bg-amber-50 border-2 border-dashed border-amber-300 text-center space-y-1">
-                <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800 block">
+              <div className="p-3.5 rounded-2xl bg-amber-50 dark:bg-[#251b0b] border-2 border-dashed border-amber-300 dark:border-amber-700/60 text-center space-y-1">
+                <span className="text-[10px] font-bold uppercase tracking-wider text-amber-800 dark:text-amber-300 block">
                   ⚡ 20-Digit Prepaid Token
                 </span>
-                <span className="text-base font-black font-mono tracking-wider text-amber-900 block select-all">
+                <span className="text-base font-black font-mono tracking-wider text-amber-900 dark:text-amber-200 block select-all">
                   {successReceipt.token}
                 </span>
                 <button
                   onClick={() => copyToClipboard(successReceipt.token || '')}
-                  className="inline-flex items-center gap-1 px-3 py-1 bg-amber-600 text-white rounded-lg text-xs font-bold shadow-xs hover:bg-amber-700 transition cursor-pointer"
+                  className="inline-flex items-center gap-1 px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-bold shadow-xs transition cursor-pointer"
                 >
                   <Copy className="w-3 h-3" />
                   <span>{copiedText === successReceipt.token ? 'Copied!' : 'Copy Token'}</span>
@@ -2511,23 +4641,23 @@ export default function App() {
               </div>
             )}
 
-            <div className="p-4 rounded-2xl bg-[#eef5ef] space-y-2 text-xs border border-green-200/60">
-              <div className="flex justify-between text-gray-600">
+            <div className="p-4 rounded-2xl bg-[#eef5ef] dark:bg-[#12241b] space-y-2 text-xs border border-green-200/60 dark:border-green-900/50">
+              <div className="flex justify-between text-gray-600 dark:text-gray-300">
                 <span>Amount:</span>
-                <strong className="text-gray-900 font-bold">₦{successReceipt.amount.toLocaleString()}</strong>
+                <strong className="text-gray-900 dark:text-white font-bold">₦{successReceipt.amount.toLocaleString()}</strong>
               </div>
-              <div className="flex justify-between text-gray-600">
+              <div className="flex justify-between text-gray-600 dark:text-gray-300">
                 <span>Reference:</span>
-                <span className="font-mono text-gray-800 text-[11px] truncate max-w-[170px]">
+                <span className="font-mono text-gray-800 dark:text-gray-200 text-[11px] truncate max-w-[170px]">
                   {successReceipt.reference}
                 </span>
               </div>
-              <div className="flex justify-between text-gray-600">
+              <div className="flex justify-between text-gray-600 dark:text-gray-300">
                 <span>Date &amp; Time:</span>
-                <span className="text-gray-800">{formatTxDisplayDate(successReceipt.createdAt)}</span>
+                <span className="text-gray-800 dark:text-gray-200">{formatTxDisplayDate(successReceipt.createdAt)}</span>
               </div>
               {successReceipt.details && (
-                <div className="pt-2 border-t border-green-200 text-gray-600 text-[11px] leading-relaxed">
+                <div className="pt-2 border-t border-green-200 dark:border-green-800/60 text-gray-600 dark:text-gray-300 text-[11px] leading-relaxed">
                   {successReceipt.details}
                 </div>
               )}
@@ -2535,7 +4665,7 @@ export default function App() {
 
             <button
               onClick={() => setSuccessReceipt(null)}
-              className="w-full py-3 bg-[#0a5c36] hover:bg-[#074729] text-white font-bold rounded-2xl transition text-sm cursor-pointer"
+              className="w-full py-3 bg-[#0a5c36] hover:bg-[#074729] dark:bg-green-700 dark:hover:bg-green-600 text-white font-bold rounded-2xl transition text-sm cursor-pointer"
             >
               Done &amp; Close Receipt
             </button>
@@ -2548,25 +4678,32 @@ export default function App() {
       {/* ==================================================== */}
       {isConfigInfoOpen && (
         <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="w-full max-w-sm bg-white rounded-[26px] p-6 shadow-2xl space-y-4 animate-in fade-in zoom-in-95">
-            <div className="flex items-center justify-between pb-2 border-b border-gray-100">
-              <div className="flex items-center gap-2">
-                <div className="w-8 h-8 rounded-xl bg-green-100 text-[#0a5c36] flex items-center justify-center">
-                  <Info className="w-4 h-4" />
+          <div className="w-full max-w-sm bg-white dark:bg-[#0f1f17] rounded-[26px] p-6 shadow-2xl space-y-4 animate-in fade-in zoom-in-95 border border-transparent dark:border-green-900/40">
+            <div className="flex items-center justify-between pb-2 border-b border-gray-100 dark:border-green-900/40">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-xl bg-white p-0.5 border border-gray-200 flex items-center justify-center overflow-hidden shrink-0">
+                  <img
+                    src={CONFIG.LOGO_URL}
+                    alt="eHUB Logo"
+                    className="w-full h-full object-contain"
+                  />
                 </div>
-                <h3 className="text-sm font-black text-gray-900">CONFIG &amp; API Integration</h3>
+                <div>
+                  <h3 className="text-sm font-black text-gray-900 dark:text-white">eHUB Configuration</h3>
+                  <span className="text-[10px] text-gray-400 dark:text-gray-400 block -mt-0.5">{CONFIG.TAGLINE}</span>
+                </div>
               </div>
               <button
                 onClick={() => setIsConfigInfoOpen(false)}
-                className="w-7 h-7 rounded-full bg-gray-100 hover:bg-gray-200 text-gray-600 flex items-center justify-center text-xs font-bold cursor-pointer"
+                className="w-7 h-7 rounded-full bg-gray-100 dark:bg-[#162a20] hover:bg-gray-200 dark:hover:bg-[#1e382b] text-gray-600 dark:text-gray-300 flex items-center justify-center text-xs font-bold cursor-pointer"
               >
                 ✕
               </button>
             </div>
 
-            <div className="space-y-3 text-xs text-gray-600">
-              <div className="p-3 rounded-xl bg-gray-50 border border-gray-200 font-mono text-[11px]">
-                <strong className="text-gray-800 block mb-1">ClubKonnect Credentials:</strong>
+            <div className="space-y-3 text-xs text-gray-600 dark:text-gray-300">
+              <div className="p-3 rounded-xl bg-gray-50 dark:bg-[#0c1912] border border-gray-200 dark:border-green-900/40 font-mono text-[11px]">
+                <strong className="text-gray-800 dark:text-white block mb-1">ClubKonnect Credentials:</strong>
                 User ID: {CONFIG.CLUBKONNECT_USER_ID}<br />
                 API Key: {CONFIG.CLUBKONNECT_API_KEY.slice(0, 14)}...<br />
                 <span className="text-[10px] text-gray-400 block mt-1">
@@ -2574,15 +4711,15 @@ export default function App() {
                 </span>
               </div>
 
-              <div className="p-3 rounded-xl bg-gray-50 border border-gray-200 font-mono text-[11px]">
-                <strong className="text-gray-800 block mb-1">Paystack Credentials:</strong>
+              <div className="p-3 rounded-xl bg-gray-50 dark:bg-[#0c1912] border border-gray-200 dark:border-green-900/40 font-mono text-[11px]">
+                <strong className="text-gray-800 dark:text-white block mb-1">Paystack Credentials:</strong>
                 Public Key: {CONFIG.PAYSTACK_PUBLIC_KEY.slice(0, 16)}...<br />
                 <span className="text-[10px] text-gray-400 block mt-1">
                   Source: https://dashboard.paystack.com/#/settings/developer
                 </span>
               </div>
 
-              <div className="p-3 rounded-xl bg-green-50 text-[#0a5c36] text-[11px] leading-relaxed">
+              <div className="p-3 rounded-xl bg-green-50 dark:bg-green-950/80 text-[#0a5c36] dark:text-[#d6ff00] text-[11px] leading-relaxed border border-transparent dark:border-green-800/40">
                 <strong>📍 Abuja Telecom Office:</strong><br />
                 {CONFIG.SUPPORT_LOCATION}
               </div>
@@ -2590,7 +4727,7 @@ export default function App() {
 
             <button
               onClick={() => setIsConfigInfoOpen(false)}
-              className="w-full py-2.5 bg-gray-100 hover:bg-gray-200 text-gray-800 font-bold rounded-2xl transition text-xs cursor-pointer"
+              className="w-full py-2.5 bg-gray-100 dark:bg-[#162a20] hover:bg-gray-200 dark:hover:bg-[#1e382b] text-gray-800 dark:text-gray-200 font-bold rounded-2xl transition text-xs cursor-pointer"
             >
               Close
             </button>

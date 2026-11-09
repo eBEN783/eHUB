@@ -19,6 +19,8 @@ export const CONFIG = {
   PAYSTACK_PUBLIC_KEY: "pk_test_5c80f200523fad3a5db033a58e9e0ca1cda3bc17",
   BUSINESS_NAME: "eHUB",
   SLOGAN: "Abuja's Cheapest",
+  TAGLINE: "Your Everyday Payments, Simplified.",
+  LOGO_URL: "/assets/aistudio/Bee_concepts_logo_design_3d5073c9.png",
   SUPPORT_PHONE: "+2348030000000",
   SUPPORT_LOCATION: "Suite 402, Banex Plaza, Wuse 2, Abuja, FCT",
 };
